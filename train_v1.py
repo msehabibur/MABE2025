@@ -27,6 +27,10 @@ from sklearn.metrics import f1_score
 
 warnings.filterwarnings('ignore')
 
+# Global containers for cross-validation reporting
+cv_per_lab_reports = []
+cv_macro_reports = []
+
 # Try importing additional models
 try:
     from xgboost import XGBClassifier
@@ -285,7 +289,8 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                         'agent_id': mouse_id_str,
                         'target_id': 'self',
                         'video_frame': single_mouse.index,
-                        'frames_per_second': row.frames_per_second
+                        'frames_per_second': row.frames_per_second,
+                        'lab_id': lab_id,
                     })
                     if traintest == 'train':
                         single_mouse_label = pd.DataFrame(0.0, columns=vid_agent_actions, index=single_mouse.index)
@@ -314,7 +319,8 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                         'agent_id': agent_str,
                         'target_id': target_str,
                         'video_frame': mouse_pair.index,
-                        'frames_per_second': row.frames_per_second
+                        'frames_per_second': row.frames_per_second,
+                        'lab_id': lab_id,
                     })
                     if traintest == 'train':
                         mouse_pair_label = pd.DataFrame(0.0, columns=vid_agent_actions, index=mouse_pair.index)
@@ -761,6 +767,69 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
         X = add_interaction_features(X, mouse_pair, avail_A, avail_B, fps)
 
     return X.astype(np.float32, copy=False)
+# ==================== CROSS-VALIDATION REPORTING ====================
+
+def run_group_cv_report(X_np, label_df, meta_df, base_estimator, actions, n_splits=5):
+    """Run GroupKFold CV and build per-lab and macro F1 reports."""
+    if 'lab_id' not in meta_df.columns:
+        return None, None
+
+    groups_all = meta_df['lab_id'].to_numpy()
+    unique_groups = np.unique(groups_all)
+    if len(unique_groups) < 2:
+        return None, None
+
+    per_lab_rows = []
+    macro_rows = []
+
+    for action in actions:
+        y_raw = label_df[action].to_numpy()
+        mask = ~pd.isna(y_raw)
+        y_action = y_raw[mask].astype(int)
+        if len(np.unique(y_action)) < 2:
+            continue
+
+        X_action = X_np[mask]
+        g_action = groups_all[mask]
+        action_groups = np.unique(g_action)
+        splits = min(n_splits, len(action_groups))
+        if splits < 2:
+            continue
+
+        cv = GroupKFold(n_splits=splits)
+        for fold_idx, (train_idx, valid_idx) in enumerate(cv.split(X_action, y_action, g_action)):
+            estimator = clone(base_estimator)
+            estimator.fit(X_action[train_idx], y_action[train_idx])
+            preds = estimator.predict(X_action[valid_idx])
+
+            y_valid = y_action[valid_idx]
+            g_valid = g_action[valid_idx]
+
+            fold_macro = f1_score(y_valid, preds, average='macro', zero_division=0)
+            macro_rows.append({
+                'action': action,
+                'fold': fold_idx,
+                'macro_f1': fold_macro,
+            })
+
+            for lab in np.unique(g_valid):
+                lab_mask = g_valid == lab
+                lab_f1 = f1_score(
+                    y_valid[lab_mask], preds[lab_mask], average='macro', zero_division=0
+                )
+                per_lab_rows.append({
+                    'action': action,
+                    'lab_id': lab,
+                    'fold': fold_idx,
+                    'macro_f1': lab_f1,
+                })
+
+    if not per_lab_rows and not macro_rows:
+        return None, None
+
+    per_lab_df = pd.DataFrame(per_lab_rows) if per_lab_rows else None
+    macro_df = pd.DataFrame(macro_rows) if macro_rows else None
+    return per_lab_df, macro_df
 # ==================== ENSEMBLE TRAINING ====================
 
 def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples):
@@ -771,6 +840,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
             lightgbm.LGBMClassifier(
                 n_estimators=225, learning_rate=0.07, min_child_samples=40,
                 num_leaves=31, subsample=0.8, colsample_bytree=0.8, verbose=-1,
+                device='gpu', gpu_platform_id=0, gpu_device_id=0,
                 random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
             ), int(n_samples/1.3),
         )
@@ -781,6 +851,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
                 n_estimators=150, learning_rate=0.1, min_child_samples=20,
                 num_leaves=63, max_depth=8, subsample=0.7, colsample_bytree=0.9,
                 reg_alpha=0.1, reg_lambda=0.1, verbose=-1,
+                device='gpu', gpu_platform_id=0, gpu_device_id=0,
                 random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
             ), int(n_samples/2),
         )
@@ -790,6 +861,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
             lightgbm.LGBMClassifier(
                 n_estimators=100, learning_rate=0.05, min_child_samples=30,
                 num_leaves=127, max_depth=10, subsample=0.75, verbose=-1,
+                device='gpu', gpu_platform_id=0, gpu_device_id=0,
                 random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
             ), int(n_samples/3),
         )
@@ -800,7 +872,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
                 XGBClassifier(
                     n_estimators=180, learning_rate=0.08, max_depth=6,
                     min_child_weight=5, subsample=0.8, colsample_bytree=0.8,
-                    tree_method='hist', verbosity=0,
+                    tree_method='gpu_hist', predictor='gpu_predictor', verbosity=0,
                     random_state=SEED
                 ), int(n_samples/1.5),
             )
@@ -811,12 +883,28 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
                 CatBoostClassifier(
                     iterations=120, learning_rate=0.1, depth=6,
                     verbose=False, allow_writing_files=False,
+                    task_type='GPU', devices='0',
                     random_seed=SEED
                 ), n_samples,
             )
         ))
 
     X_tr_np = X_tr.to_numpy(np.float32, copy=False)
+
+    if models:
+        base_estimator = models[0]
+        per_lab_df, macro_df = run_group_cv_report(
+            X_tr_np, label, meta, base_estimator, label.columns
+        )
+        if per_lab_df is not None:
+            per_lab_df['body_parts'] = body_parts_tracked_str
+            per_lab_df['mode'] = switch_tr
+            cv_per_lab_reports.append(per_lab_df)
+        if macro_df is not None:
+            macro_df['body_parts'] = body_parts_tracked_str
+            macro_df['mode'] = switch_tr
+            cv_macro_reports.append(macro_df)
+
     del X_tr; gc.collect()
 
     model_list = []
@@ -1032,6 +1120,37 @@ for section in range(1, len(body_parts_tracked_list)):
 
     gc.collect()
     print()
+
+if cv_per_lab_reports:
+    per_lab_report_df = pd.concat(cv_per_lab_reports, ignore_index=True)
+    per_lab_summary_df = (
+        per_lab_report_df
+        .groupby(['mode', 'body_parts', 'lab_id'])['macro_f1']
+        .mean()
+        .reset_index(name='mean_macro_f1')
+    )
+    per_lab_report_df.to_csv('cv_per_lab_report.csv', index=False)
+    per_lab_summary_df.to_csv('cv_per_lab_summary.csv', index=False)
+    print('Saved per-lab CV report to cv_per_lab_report.csv and summary to cv_per_lab_summary.csv')
+
+if cv_macro_reports:
+    macro_report_df = pd.concat(cv_macro_reports, ignore_index=True)
+    macro_summary_df = (
+        macro_report_df
+        .groupby(['mode', 'body_parts', 'action'])['macro_f1']
+        .mean()
+        .reset_index(name='mean_macro_f1')
+    )
+    overall_macro_df = (
+        macro_summary_df
+        .groupby(['mode', 'body_parts'])['mean_macro_f1']
+        .mean()
+        .reset_index(name='overall_macro_f1')
+    )
+    macro_report_df.to_csv('cv_macro_f1_report.csv', index=False)
+    macro_summary_df.to_csv('cv_macro_f1_summary.csv', index=False)
+    overall_macro_df.to_csv('cv_macro_f1_overall.csv', index=False)
+    print('Saved macro F1 CV report to cv_macro_f1_report.csv with summaries')
 
 if len(submission_list) > 0:
     submission = pd.concat(submission_list, ignore_index=True)
