@@ -329,11 +329,11 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
 # ==================== ADAPTIVE THRESHOLDING ====================
 
 action_thresholds = {
-    "default": 0.27,
-    "single_default": 0.27,
-    "pair_default": 0.27,
+    "default": 0.44,
+    "single_default": 0.44,
+    "pair_default": 0.44,
     "single": {
-        "rear": 0.30,
+        "rear": 0.44,
     },
 }
 
