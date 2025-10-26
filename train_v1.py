@@ -789,13 +789,16 @@ def train_with_cv(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_sample
         'feature_fraction_seed': SEED,
         'data_random_seed': SEED
     }
+    # GPU requires higher min_child_samples to avoid split errors
+    min_child_boost = 20 if USE_GPU else 0
+
     if USE_GPU:
         lgbm_params_base.update({'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0})
 
     models.append(make_pipeline(
         StratifiedSubsetClassifier(
             lightgbm.LGBMClassifier(
-                n_estimators=225, learning_rate=0.07, min_child_samples=40,
+                n_estimators=225, learning_rate=0.07, min_child_samples=40+min_child_boost,
                 num_leaves=31, subsample=0.8, colsample_bytree=0.8,
                 **lgbm_params_base
             ), int(n_samples/1.3),
@@ -804,7 +807,7 @@ def train_with_cv(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_sample
     models.append(make_pipeline(
         StratifiedSubsetClassifier(
             lightgbm.LGBMClassifier(
-                n_estimators=150, learning_rate=0.1, min_child_samples=20,
+                n_estimators=150, learning_rate=0.1, min_child_samples=20+min_child_boost,
                 num_leaves=63, max_depth=8, subsample=0.7, colsample_bytree=0.9,
                 reg_alpha=0.1, reg_lambda=0.1,
                 **lgbm_params_base
@@ -814,7 +817,7 @@ def train_with_cv(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_sample
     models.append(make_pipeline(
         StratifiedSubsetClassifier(
             lightgbm.LGBMClassifier(
-                n_estimators=100, learning_rate=0.05, min_child_samples=30,
+                n_estimators=100, learning_rate=0.05, min_child_samples=30+min_child_boost,
                 num_leaves=127, max_depth=10, subsample=0.75,
                 **lgbm_params_base
             ), int(n_samples/3),
@@ -904,8 +907,29 @@ def train_with_cv(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_sample
                     preds = m_clone.predict_proba(X_val_fold)[:, 1]
                     fold_preds.append(preds)
                 except Exception as e:
-                    if verbose:
-                        print(f"  Model {model_idx} failed: {str(e)[:50]}")
+                    error_msg = str(e)
+                    # If GPU training fails, try CPU as fallback
+                    if 'GPU' in error_msg or 'gpu' in error_msg or 'best_split_info' in error_msg:
+                        if verbose:
+                            print(f"  Model {model_idx} GPU failed, trying CPU fallback...")
+                        try:
+                            # Clone and recreate with CPU
+                            m_cpu = clone(m)
+                            # Try to switch to CPU if possible
+                            if hasattr(m_cpu.steps[0][1].estimator, 'set_params'):
+                                try:
+                                    m_cpu.steps[0][1].estimator.set_params(device='cpu')
+                                except:
+                                    pass
+                            m_cpu.fit(X_train_fold, y_train_fold)
+                            preds = m_cpu.predict_proba(X_val_fold)[:, 1]
+                            fold_preds.append(preds)
+                        except Exception as e2:
+                            if verbose:
+                                print(f"  Model {model_idx} CPU fallback also failed: {str(e2)[:50]}")
+                    else:
+                        if verbose:
+                            print(f"  Model {model_idx} failed: {error_msg[:80]}")
 
             # Average predictions
             if len(fold_preds) > 0:
@@ -925,14 +949,32 @@ def train_with_cv(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_sample
 
         # Train final models on all data for this action
         trained = []
-        for m in models:
+        for model_idx, m in enumerate(models):
             m_clone = clone(m)
             try:
                 m_clone.fit(X_action, y_action)
                 trained.append(m_clone)
             except Exception as e:
-                if verbose:
-                    print(f"  Model training failed: {str(e)[:50]}")
+                error_msg = str(e)
+                # If GPU training fails, try CPU as fallback
+                if 'GPU' in error_msg or 'gpu' in error_msg or 'best_split_info' in error_msg:
+                    if verbose:
+                        print(f"  Model {model_idx} GPU failed on final training, trying CPU...")
+                    try:
+                        m_cpu = clone(m)
+                        if hasattr(m_cpu.steps[0][1].estimator, 'set_params'):
+                            try:
+                                m_cpu.steps[0][1].estimator.set_params(device='cpu')
+                            except:
+                                pass
+                        m_cpu.fit(X_action, y_action)
+                        trained.append(m_cpu)
+                    except Exception as e2:
+                        if verbose:
+                            print(f"  Model {model_idx} CPU fallback failed: {str(e2)[:50]}")
+                else:
+                    if verbose:
+                        print(f"  Model training failed: {error_msg[:80]}")
 
         if len(trained) > 0:
             model_list_final.append((action, trained))
@@ -1012,13 +1054,16 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
             'feature_fraction_seed': SEED,
             'data_random_seed': SEED
         }
+        # GPU requires higher min_child_samples to avoid split errors
+        min_child_boost = 20 if USE_GPU else 0
+
         if USE_GPU:
             lgbm_params_base.update({'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0})
 
         models.append(make_pipeline(
             StratifiedSubsetClassifier(
                 lightgbm.LGBMClassifier(
-                    n_estimators=225, learning_rate=0.07, min_child_samples=40,
+                    n_estimators=225, learning_rate=0.07, min_child_samples=40+min_child_boost,
                     num_leaves=31, subsample=0.8, colsample_bytree=0.8,
                     **lgbm_params_base
                 ), int(n_samples/1.3),
@@ -1027,7 +1072,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
         models.append(make_pipeline(
             StratifiedSubsetClassifier(
                 lightgbm.LGBMClassifier(
-                    n_estimators=150, learning_rate=0.1, min_child_samples=20,
+                    n_estimators=150, learning_rate=0.1, min_child_samples=20+min_child_boost,
                     num_leaves=63, max_depth=8, subsample=0.7, colsample_bytree=0.9,
                     reg_alpha=0.1, reg_lambda=0.1,
                     **lgbm_params_base
@@ -1037,7 +1082,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
         models.append(make_pipeline(
             StratifiedSubsetClassifier(
                 lightgbm.LGBMClassifier(
-                    n_estimators=100, learning_rate=0.05, min_child_samples=30,
+                    n_estimators=100, learning_rate=0.05, min_child_samples=30+min_child_boost,
                     num_leaves=127, max_depth=10, subsample=0.75,
                     **lgbm_params_base
                 ), int(n_samples/3),
@@ -1094,11 +1139,34 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
             if not (y_action == 0).all() and np.sum(y_action) >= 5:
                 trained = []
                 idx = np.flatnonzero(mask)
-                for m in models:
+                for model_idx, m in enumerate(models):
                     m_clone = clone(m)
-                    m_clone.fit(X_tr_np[idx], y_action)
-                    trained.append(m_clone)
-                model_list.append((action, trained))
+                    try:
+                        m_clone.fit(X_tr_np[idx], y_action)
+                        trained.append(m_clone)
+                    except Exception as e:
+                        error_msg = str(e)
+                        # If GPU training fails, try CPU as fallback
+                        if 'GPU' in error_msg or 'gpu' in error_msg or 'best_split_info' in error_msg:
+                            if verbose:
+                                print(f"  Model {model_idx} GPU failed, trying CPU...")
+                            try:
+                                m_cpu = clone(m)
+                                if hasattr(m_cpu.steps[0][1].estimator, 'set_params'):
+                                    try:
+                                        m_cpu.steps[0][1].estimator.set_params(device='cpu')
+                                    except:
+                                        pass
+                                m_cpu.fit(X_tr_np[idx], y_action)
+                                trained.append(m_cpu)
+                            except Exception as e2:
+                                if verbose:
+                                    print(f"  Model {model_idx} CPU fallback failed: {str(e2)[:50]}")
+                        else:
+                            if verbose:
+                                print(f"  Model {model_idx} failed: {error_msg[:80]}")
+                if len(trained) > 0:
+                    model_list.append((action, trained))
 
         del X_tr_np; gc.collect()
 
@@ -1120,8 +1188,9 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
         .to_dict()
     )
 
+    n_models = len(model_list) if model_list else 0
     if verbose:
-        print(f"n_videos: {len(test_subset)}, n_models: {len(models)}")
+        print(f"n_videos: {len(test_subset)}, n_models: {n_models}")
 
     for switch_te, data_te, meta_te, actions_te in generator:
         assert switch_te == switch_tr

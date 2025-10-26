@@ -88,6 +88,12 @@ To use GPU acceleration, ensure you have:
 - XGBoost with GPU support (optional)
 - CatBoost with GPU support (optional)
 
+**GPU Error Handling:**
+- The code includes automatic CPU fallback if GPU training fails
+- GPU uses higher `min_child_samples` (+20) to avoid split errors
+- If a GPU error is detected, the model automatically retries with CPU
+- Warnings about GPU failures will be displayed but won't stop training
+
 If GPU is not available, set `USE_GPU = False` and the code will automatically use CPU.
 
 #### Test Coverage
