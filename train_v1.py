@@ -6,6 +6,13 @@
 validate_or_submit = 'submit'
 verbose = True
 
+# Cross-validation configuration
+USE_CROSS_VALIDATION = True
+N_CV_FOLDS = 5
+
+# GPU configuration
+USE_GPU = True  # Set to False to use CPU
+
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
@@ -768,15 +775,29 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
     return X.astype(np.float32, copy=False)
 # ==================== ENSEMBLE TRAINING ====================
 
-def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples):
+def train_with_cv(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples, n_folds=5):
+    """Train models with K-fold cross-validation and return validation scores"""
+    from sklearn.model_selection import KFold
+
     models = []
+
+    # LightGBM models with GPU/CPU support
+    lgbm_params_base = {
+        'verbose': -1,
+        'random_state': SEED,
+        'bagging_seed': SEED,
+        'feature_fraction_seed': SEED,
+        'data_random_seed': SEED
+    }
+    if USE_GPU:
+        lgbm_params_base.update({'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0})
 
     models.append(make_pipeline(
         StratifiedSubsetClassifier(
             lightgbm.LGBMClassifier(
                 n_estimators=225, learning_rate=0.07, min_child_samples=40,
-                num_leaves=31, subsample=0.8, colsample_bytree=0.8, verbose=-1,
-                random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
+                num_leaves=31, subsample=0.8, colsample_bytree=0.8,
+                **lgbm_params_base
             ), int(n_samples/1.3),
         )
     ))
@@ -785,8 +806,8 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
             lightgbm.LGBMClassifier(
                 n_estimators=150, learning_rate=0.1, min_child_samples=20,
                 num_leaves=63, max_depth=8, subsample=0.7, colsample_bytree=0.9,
-                reg_alpha=0.1, reg_lambda=0.1, verbose=-1,
-                random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
+                reg_alpha=0.1, reg_lambda=0.1,
+                **lgbm_params_base
             ), int(n_samples/2),
         )
     ))
@@ -794,51 +815,292 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
         StratifiedSubsetClassifier(
             lightgbm.LGBMClassifier(
                 n_estimators=100, learning_rate=0.05, min_child_samples=30,
-                num_leaves=127, max_depth=10, subsample=0.75, verbose=-1,
-                random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
+                num_leaves=127, max_depth=10, subsample=0.75,
+                **lgbm_params_base
             ), int(n_samples/3),
         )
     ))
+
     if XGBOOST_AVAILABLE:
+        xgb_params = {
+            'n_estimators': 180,
+            'learning_rate': 0.08,
+            'max_depth': 6,
+            'min_child_weight': 5,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'tree_method': 'gpu_hist' if USE_GPU else 'hist',
+            'verbosity': 0,
+            'random_state': SEED
+        }
+        if USE_GPU:
+            xgb_params['gpu_id'] = 0
+
         models.append(make_pipeline(
             StratifiedSubsetClassifier(
-                XGBClassifier(
-                    n_estimators=180, learning_rate=0.08, max_depth=6,
-                    min_child_weight=5, subsample=0.8, colsample_bytree=0.8,
-                    tree_method='hist', verbosity=0,
-                    random_state=SEED
-                ), int(n_samples/1.5),
+                XGBClassifier(**xgb_params),
+                int(n_samples/1.5),
             )
         ))
+
     if CATBOOST_AVAILABLE:
+        catboost_params = {
+            'iterations': 120,
+            'learning_rate': 0.1,
+            'depth': 6,
+            'verbose': False,
+            'allow_writing_files': False,
+            'random_seed': SEED
+        }
+        if USE_GPU:
+            catboost_params.update({'task_type': 'GPU', 'devices': '0'})
+
         models.append(make_pipeline(
             StratifiedSubsetClassifier(
-                CatBoostClassifier(
-                    iterations=120, learning_rate=0.1, depth=6,
-                    verbose=False, allow_writing_files=False,
-                    random_seed=SEED
-                ), n_samples,
+                CatBoostClassifier(**catboost_params),
+                n_samples,
             )
         ))
 
     X_tr_np = X_tr.to_numpy(np.float32, copy=False)
-    del X_tr; gc.collect()
 
-    model_list = []
+    # Perform cross-validation per action
+    cv_scores = {}
+    model_list_final = []
+
+    print(f"\n{'='*60}")
+    print(f"Starting {n_folds}-Fold Cross-Validation")
+    print(f"{'='*60}")
+
     for action in label.columns:
         y_raw = label[action].to_numpy()
         mask = ~pd.isna(y_raw)
         y_action = y_raw[mask].astype(int)
-        if not (y_action == 0).all() and np.sum(y_action) >= 5:
-            trained = []
-            idx = np.flatnonzero(mask)
-            for m in models:
-                m_clone = clone(m)
-                m_clone.fit(X_tr_np[idx], y_action)
-                trained.append(m_clone)
-            model_list.append((action, trained))
 
-    del X_tr_np; gc.collect()
+        if (y_action == 0).all() or np.sum(y_action) < 5:
+            continue
+
+        idx = np.flatnonzero(mask)
+        X_action = X_tr_np[idx]
+
+        # K-Fold CV
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=SEED)
+        fold_scores = []
+
+        print(f"\nAction: {action} (positives: {np.sum(y_action)}/{len(y_action)})")
+
+        for fold_idx, (train_idx, val_idx) in enumerate(kf.split(X_action)):
+            X_train_fold = X_action[train_idx]
+            y_train_fold = y_action[train_idx]
+            X_val_fold = X_action[val_idx]
+            y_val_fold = y_action[val_idx]
+
+            # Train ensemble on this fold
+            fold_preds = []
+            for model_idx, m in enumerate(models):
+                m_clone = clone(m)
+                try:
+                    m_clone.fit(X_train_fold, y_train_fold)
+                    preds = m_clone.predict_proba(X_val_fold)[:, 1]
+                    fold_preds.append(preds)
+                except Exception as e:
+                    if verbose:
+                        print(f"  Model {model_idx} failed: {str(e)[:50]}")
+
+            # Average predictions
+            if len(fold_preds) > 0:
+                avg_preds = np.mean(fold_preds, axis=0)
+                # Calculate F1 score
+                from sklearn.metrics import f1_score
+                binary_preds = (avg_preds > 0.5).astype(int)
+                fold_f1 = f1_score(y_val_fold, binary_preds)
+                fold_scores.append(fold_f1)
+                print(f"  Fold {fold_idx+1}: F1 = {fold_f1:.4f}")
+
+        if len(fold_scores) > 0:
+            mean_f1 = np.mean(fold_scores)
+            std_f1 = np.std(fold_scores)
+            cv_scores[action] = {'mean': mean_f1, 'std': std_f1, 'folds': fold_scores}
+            print(f"  Mean CV F1: {mean_f1:.4f} ± {std_f1:.4f}")
+
+        # Train final models on all data for this action
+        trained = []
+        for m in models:
+            m_clone = clone(m)
+            try:
+                m_clone.fit(X_action, y_action)
+                trained.append(m_clone)
+            except Exception as e:
+                if verbose:
+                    print(f"  Model training failed: {str(e)[:50]}")
+
+        if len(trained) > 0:
+            model_list_final.append((action, trained))
+
+    print(f"\n{'='*60}")
+    print(f"Cross-Validation Summary")
+    print(f"{'='*60}")
+    if cv_scores:
+        print(f"{'Action':<20} {'Mean F1':<12} {'Std F1':<12}")
+        print(f"{'-'*44}")
+        for action, scores in cv_scores.items():
+            print(f"{action:<20} {scores['mean']:<12.4f} {scores['std']:<12.4f}")
+
+        # Calculate macro-average F1
+        macro_f1 = np.mean([s['mean'] for s in cv_scores.values()])
+        print(f"{'-'*44}")
+        print(f"{'Macro F1 (avg)':<20} {macro_f1:<12.4f}")
+        print(f"{'='*60}\n")
+
+    del X_tr_np
+    gc.collect()
+
+    return model_list_final, cv_scores
+
+def calculate_lab_f1_scores(train_data, predictions_by_lab):
+    """Calculate F1 scores per lab and macro F1"""
+    lab_scores = {}
+
+    for lab_id in train_data['lab_id'].unique():
+        lab_data = train_data[train_data['lab_id'] == lab_id]
+        if lab_id in predictions_by_lab:
+            try:
+                lab_score = single_lab_f1(
+                    pl.DataFrame(lab_data),
+                    pl.DataFrame(predictions_by_lab[lab_id]),
+                    beta=1.0
+                )
+                lab_scores[lab_id] = lab_score
+            except Exception as e:
+                if verbose:
+                    print(f"Could not calculate score for lab {lab_id}: {str(e)[:50]}")
+
+    if lab_scores:
+        print(f"\n{'='*60}")
+        print(f"Lab-wise F1 Scores")
+        print(f"{'='*60}")
+        print(f"{'Lab ID':<30} {'F1 Score':<12}")
+        print(f"{'-'*42}")
+        for lab_id, score in sorted(lab_scores.items()):
+            print(f"{lab_id:<30} {score:<12.4f}")
+
+        macro_f1 = np.mean(list(lab_scores.values()))
+        print(f"{'-'*42}")
+        print(f"{'Macro F1 (across labs)':<30} {macro_f1:<12.4f}")
+        print(f"{'='*60}\n")
+
+        return lab_scores, macro_f1
+
+    return {}, 0.0
+
+def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples, use_cv=True, n_folds=5):
+    """Train ensemble and make predictions on test set"""
+
+    # Use CV or standard training
+    if use_cv:
+        model_list, cv_scores = train_with_cv(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples, n_folds)
+        del X_tr
+        gc.collect()
+    else:
+        models = []
+
+        # LightGBM models with GPU/CPU support
+        lgbm_params_base = {
+            'verbose': -1,
+            'random_state': SEED,
+            'bagging_seed': SEED,
+            'feature_fraction_seed': SEED,
+            'data_random_seed': SEED
+        }
+        if USE_GPU:
+            lgbm_params_base.update({'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0})
+
+        models.append(make_pipeline(
+            StratifiedSubsetClassifier(
+                lightgbm.LGBMClassifier(
+                    n_estimators=225, learning_rate=0.07, min_child_samples=40,
+                    num_leaves=31, subsample=0.8, colsample_bytree=0.8,
+                    **lgbm_params_base
+                ), int(n_samples/1.3),
+            )
+        ))
+        models.append(make_pipeline(
+            StratifiedSubsetClassifier(
+                lightgbm.LGBMClassifier(
+                    n_estimators=150, learning_rate=0.1, min_child_samples=20,
+                    num_leaves=63, max_depth=8, subsample=0.7, colsample_bytree=0.9,
+                    reg_alpha=0.1, reg_lambda=0.1,
+                    **lgbm_params_base
+                ), int(n_samples/2),
+            )
+        ))
+        models.append(make_pipeline(
+            StratifiedSubsetClassifier(
+                lightgbm.LGBMClassifier(
+                    n_estimators=100, learning_rate=0.05, min_child_samples=30,
+                    num_leaves=127, max_depth=10, subsample=0.75,
+                    **lgbm_params_base
+                ), int(n_samples/3),
+            )
+        ))
+        if XGBOOST_AVAILABLE:
+            xgb_params = {
+                'n_estimators': 180,
+                'learning_rate': 0.08,
+                'max_depth': 6,
+                'min_child_weight': 5,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8,
+                'tree_method': 'gpu_hist' if USE_GPU else 'hist',
+                'verbosity': 0,
+                'random_state': SEED
+            }
+            if USE_GPU:
+                xgb_params['gpu_id'] = 0
+
+            models.append(make_pipeline(
+                StratifiedSubsetClassifier(
+                    XGBClassifier(**xgb_params),
+                    int(n_samples/1.5),
+                )
+            ))
+        if CATBOOST_AVAILABLE:
+            catboost_params = {
+                'iterations': 120,
+                'learning_rate': 0.1,
+                'depth': 6,
+                'verbose': False,
+                'allow_writing_files': False,
+                'random_seed': SEED
+            }
+            if USE_GPU:
+                catboost_params.update({'task_type': 'GPU', 'devices': '0'})
+
+            models.append(make_pipeline(
+                StratifiedSubsetClassifier(
+                    CatBoostClassifier(**catboost_params),
+                    n_samples,
+                )
+            ))
+
+        X_tr_np = X_tr.to_numpy(np.float32, copy=False)
+        del X_tr; gc.collect()
+
+        model_list = []
+        for action in label.columns:
+            y_raw = label[action].to_numpy()
+            mask = ~pd.isna(y_raw)
+            y_action = y_raw[mask].astype(int)
+            if not (y_action == 0).all() and np.sum(y_action) >= 5:
+                trained = []
+                idx = np.flatnonzero(mask)
+                for m in models:
+                    m_clone = clone(m)
+                    m_clone.fit(X_tr_np[idx], y_action)
+                    trained.append(m_clone)
+                model_list.append((action, trained))
+
+        del X_tr_np; gc.collect()
 
     body_parts_tracked = json.loads(body_parts_tracked_str)
     if len(body_parts_tracked) > 5:
@@ -958,7 +1220,16 @@ def robustify(submission, dataset, traintest, traintest_directory=None):
 if __name__ == "__main__":
     submission_list = []
 
-    print(f"XGBoost: {XGBOOST_AVAILABLE}, CatBoost: {CATBOOST_AVAILABLE}\n")
+    print(f"\n{'='*60}")
+    print(f"Training Configuration")
+    print(f"{'='*60}")
+    print(f"XGBoost: {XGBOOST_AVAILABLE}")
+    print(f"CatBoost: {CATBOOST_AVAILABLE}")
+    print(f"GPU Enabled: {USE_GPU}")
+    print(f"Cross-Validation: {USE_CROSS_VALIDATION}")
+    if USE_CROSS_VALIDATION:
+        print(f"Number of CV Folds: {N_CV_FOLDS}")
+    print(f"{'='*60}\n")
 
     for section in range(1, len(body_parts_tracked_list)):
         body_parts_tracked_str = body_parts_tracked_list[section]
@@ -1006,7 +1277,8 @@ if __name__ == "__main__":
                 gc.collect()
 
                 print(f"  Single: {X_tr.shape}")
-                submit_ensemble(body_parts_tracked_str, 'single', X_tr, single_label, single_meta, 2_000_000)
+                submit_ensemble(body_parts_tracked_str, 'single', X_tr, single_label, single_meta, 2_000_000,
+                               use_cv=USE_CROSS_VALIDATION, n_folds=N_CV_FOLDS)
 
                 del X_tr, single_label, single_meta
                 gc.collect()
@@ -1028,7 +1300,8 @@ if __name__ == "__main__":
                 gc.collect()
 
                 print(f"  Pair: {X_tr.shape}")
-                submit_ensemble(body_parts_tracked_str, 'pair', X_tr, pair_label, pair_meta, 900_000)
+                submit_ensemble(body_parts_tracked_str, 'pair', X_tr, pair_label, pair_meta, 900_000,
+                               use_cv=USE_CROSS_VALIDATION, n_folds=N_CV_FOLDS)
 
                 del X_tr, pair_label, pair_meta
                 gc.collect()
