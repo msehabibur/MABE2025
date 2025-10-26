@@ -9,6 +9,7 @@ verbose = True
 # Cross-validation configuration
 USE_CROSS_VALIDATION = True
 N_CV_FOLDS = 5
+USE_LAB_CV = True  # Cross-validation across labs
 
 # GPU configuration
 USE_GPU = True  # Set to False to use CPU
@@ -294,6 +295,7 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                     assert len(single_mouse) == len(pvid)
                     single_mouse_meta = pd.DataFrame({
                         'video_id': video_id,
+                        'lab_id': lab_id,
                         'agent_id': mouse_id_str,
                         'target_id': 'self',
                         'video_frame': single_mouse.index,
@@ -323,6 +325,7 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                     assert len(mouse_pair) == len(pvid)
                     mouse_pair_meta = pd.DataFrame({
                         'video_id': video_id,
+                        'lab_id': lab_id,
                         'agent_id': agent_str,
                         'target_id': target_str,
                         'video_frame': mouse_pair.index,
@@ -1035,6 +1038,150 @@ def calculate_lab_f1_scores(train_data, predictions_by_lab):
 
     return {}, 0.0
 
+def evaluate_lab_cv(X_tr, label, meta, n_samples, body_parts_tracked_str, switch_tr):
+    """
+    Perform leave-one-lab-out cross-validation
+    Train on N-1 labs, validate on 1 lab, report per-lab and macro F1 scores
+    """
+    from sklearn.model_selection import LeaveOneGroupOut
+
+    # Check if we have lab_id in meta
+    if 'lab_id' not in meta.columns:
+        print("Warning: lab_id not found in metadata, skipping lab CV")
+        return {}, 0.0
+
+    # Get unique labs
+    labs = meta['lab_id'].values
+    unique_labs = np.unique(labs)
+    n_labs = len(unique_labs)
+
+    if n_labs < 2:
+        print(f"Warning: Only {n_labs} lab(s) found, skipping lab CV")
+        return {}, 0.0
+
+    print(f"\n{'='*60}")
+    print(f"Leave-One-Lab-Out Cross-Validation")
+    print(f"{'='*60}")
+    print(f"Total labs: {n_labs}")
+    print(f"Labs: {', '.join(map(str, unique_labs))}")
+    print(f"Strategy: Train on {n_labs-1} labs, validate on 1 lab")
+    print(f"{'='*60}\n")
+
+    logo = LeaveOneGroupOut()
+    X_tr_np = X_tr.to_numpy(np.float32, copy=False)
+
+    lab_f1_scores = {}
+
+    for fold_idx, (train_idx, val_idx) in enumerate(logo.split(X_tr_np, groups=labs)):
+        val_lab = unique_labs[fold_idx]
+        train_labs = unique_labs[unique_labs != val_lab]
+
+        print(f"\nFold {fold_idx+1}/{n_labs}: Validating on lab '{val_lab}'")
+        print(f"  Training on {len(train_labs)} labs: {', '.join(map(str, train_labs))}")
+        print(f"  Validation samples: {len(val_idx)}")
+
+        # Build models for this fold
+        models = []
+        lgbm_params_base = {
+            'verbose': -1,
+            'random_state': SEED,
+            'bagging_seed': SEED,
+            'feature_fraction_seed': SEED,
+            'data_random_seed': SEED
+        }
+        min_child_boost = 20 if USE_GPU else 0
+        if USE_GPU:
+            lgbm_params_base.update({'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0})
+
+        models.append(make_pipeline(
+            StratifiedSubsetClassifier(
+                lightgbm.LGBMClassifier(
+                    n_estimators=150, learning_rate=0.1, min_child_samples=20+min_child_boost,
+                    num_leaves=63, subsample=0.8, colsample_bytree=0.8,
+                    **lgbm_params_base
+                ), int(n_samples/2),
+            )
+        ))
+
+        # Train and evaluate for each action
+        action_f1_scores = {}
+
+        for action in label.columns:
+            y_raw = label[action].to_numpy()
+            mask = ~pd.isna(y_raw)
+            y_all = y_raw[mask].astype(int)
+            idx_all = np.flatnonzero(mask)
+
+            if len(y_all) < 10 or y_all.sum() < 5:
+                continue
+
+            # Get train/val indices for this action
+            train_mask = np.isin(idx_all, train_idx)
+            val_mask = np.isin(idx_all, val_idx)
+
+            idx_train = idx_all[train_mask]
+            idx_val = idx_all[val_mask]
+
+            if len(idx_val) == 0 or y_all[val_mask].sum() == 0:
+                continue
+
+            y_train = y_all[train_mask]
+            y_val = y_all[val_mask]
+
+            # Train model
+            try:
+                m = clone(models[0])
+                m.fit(X_tr_np[idx_train], y_train)
+
+                # Predict on validation
+                y_pred_proba = m.predict_proba(X_tr_np[idx_val])[:, 1]
+                y_pred = (y_pred_proba > 0.5).astype(int)
+
+                # Calculate F1
+                from sklearn.metrics import f1_score
+                f1 = f1_score(y_val, y_pred, zero_division=0)
+                action_f1_scores[action] = f1
+
+            except Exception as e:
+                error_msg = str(e)
+                if 'GPU' in error_msg or 'gpu' in error_msg or 'best_split_info' in error_msg:
+                    try:
+                        m_cpu = clone(models[0])
+                        if hasattr(m_cpu.steps[0][1].estimator, 'set_params'):
+                            m_cpu.steps[0][1].estimator.set_params(device='cpu')
+                        m_cpu.fit(X_tr_np[idx_train], y_train)
+                        y_pred_proba = m_cpu.predict_proba(X_tr_np[idx_val])[:, 1]
+                        y_pred = (y_pred_proba > 0.5).astype(int)
+                        f1 = f1_score(y_val, y_pred, zero_division=0)
+                        action_f1_scores[action] = f1
+                    except:
+                        continue
+
+        if action_f1_scores:
+            lab_f1 = np.mean(list(action_f1_scores.values()))
+            lab_f1_scores[val_lab] = lab_f1
+            print(f"  Lab '{val_lab}' F1: {lab_f1:.4f} (avg across {len(action_f1_scores)} actions)")
+
+    # Report summary
+    if lab_f1_scores:
+        print(f"\n{'='*60}")
+        print(f"Lab-wise Cross-Validation Results")
+        print(f"{'='*60}")
+        print(f"{'Lab ID':<30} {'F1 Score':<12}")
+        print(f"{'-'*42}")
+        for lab_id, f1 in sorted(lab_f1_scores.items()):
+            print(f"{str(lab_id):<30} {f1:<12.4f}")
+
+        macro_f1 = np.mean(list(lab_f1_scores.values()))
+        print(f"{'-'*42}")
+        print(f"{'Macro F1 (across labs)':<30} {macro_f1:<12.4f}")
+        print(f"{'='*60}\n")
+
+        return lab_f1_scores, macro_f1
+
+    del X_tr_np
+    return {}, 0.0
+
 def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples, use_cv=True, n_folds=5):
     """Train ensemble and make predictions on test set"""
 
@@ -1295,9 +1442,12 @@ if __name__ == "__main__":
     print(f"XGBoost: {XGBOOST_AVAILABLE}")
     print(f"CatBoost: {CATBOOST_AVAILABLE}")
     print(f"GPU Enabled: {USE_GPU}")
-    print(f"Cross-Validation: {USE_CROSS_VALIDATION}")
+    print(f"Cross-Validation (Actions): {USE_CROSS_VALIDATION}")
     if USE_CROSS_VALIDATION:
-        print(f"Number of CV Folds: {N_CV_FOLDS}")
+        print(f"  Number of CV Folds: {N_CV_FOLDS}")
+    print(f"Cross-Validation (Labs): {USE_LAB_CV}")
+    if USE_LAB_CV:
+        print(f"  Strategy: Leave-One-Lab-Out")
     print(f"{'='*60}\n")
 
     for section in range(1, len(body_parts_tracked_list)):
@@ -1349,6 +1499,10 @@ if __name__ == "__main__":
                 submit_ensemble(body_parts_tracked_str, 'single', X_tr, single_label, single_meta, 2_000_000,
                                use_cv=USE_CROSS_VALIDATION, n_folds=N_CV_FOLDS)
 
+                # Lab-wise cross-validation
+                if USE_LAB_CV:
+                    evaluate_lab_cv(X_tr, single_label, single_meta, 2_000_000, body_parts_tracked_str, 'single')
+
                 del X_tr, single_label, single_meta
                 gc.collect()
 
@@ -1371,6 +1525,10 @@ if __name__ == "__main__":
                 print(f"  Pair: {X_tr.shape}")
                 submit_ensemble(body_parts_tracked_str, 'pair', X_tr, pair_label, pair_meta, 900_000,
                                use_cv=USE_CROSS_VALIDATION, n_folds=N_CV_FOLDS)
+
+                # Lab-wise cross-validation
+                if USE_LAB_CV:
+                    evaluate_lab_cv(X_tr, pair_label, pair_meta, 900_000, body_parts_tracked_str, 'pair')
 
                 del X_tr, pair_label, pair_meta
                 gc.collect()
