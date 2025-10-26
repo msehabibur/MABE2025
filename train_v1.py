@@ -225,15 +225,20 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
     return mouse_fbeta(solution, submission, beta=beta)
 # ==================== DATA LOADING ====================
 
-train = pd.read_csv('/kaggle/input/MABe-mouse-behavior-detection/train.csv')
-train['n_mice'] = 4 - train[['mouse1_strain', 'mouse2_strain', 'mouse3_strain', 'mouse4_strain']].isna().sum(axis=1)
+if __name__ == "__main__":
+    train = pd.read_csv('/kaggle/input/MABe-mouse-behavior-detection/train.csv')
+    train['n_mice'] = 4 - train[['mouse1_strain', 'mouse2_strain', 'mouse3_strain', 'mouse4_strain']].isna().sum(axis=1)
 
-test = pd.read_csv('/kaggle/input/MABe-mouse-behavior-detection/test.csv')
-body_parts_tracked_list = list(np.unique(train.body_parts_tracked))
+    test = pd.read_csv('/kaggle/input/MABe-mouse-behavior-detection/test.csv')
+    body_parts_tracked_list = list(np.unique(train.body_parts_tracked))
 
-drop_body_parts = ['headpiece_bottombackleft', 'headpiece_bottombackright', 'headpiece_bottomfrontleft', 'headpiece_bottomfrontright', 
-                   'headpiece_topbackleft', 'headpiece_topbackright', 'headpiece_topfrontleft', 'headpiece_topfrontright', 
-                   'spine_1', 'spine_2', 'tail_middle_1', 'tail_middle_2', 'tail_midpoint']
+    drop_body_parts = ['headpiece_bottombackleft', 'headpiece_bottombackright', 'headpiece_bottomfrontleft', 'headpiece_bottomfrontright',
+                       'headpiece_topbackleft', 'headpiece_topbackright', 'headpiece_topfrontleft', 'headpiece_topfrontright',
+                       'spine_1', 'spine_2', 'tail_middle_1', 'tail_middle_2', 'tail_midpoint']
+else:
+    drop_body_parts = ['headpiece_bottombackleft', 'headpiece_bottombackright', 'headpiece_bottomfrontleft', 'headpiece_bottomfrontright',
+                       'headpiece_topbackleft', 'headpiece_topbackright', 'headpiece_topfrontleft', 'headpiece_topfrontright',
+                       'spine_1', 'spine_2', 'tail_middle_1', 'tail_middle_2', 'tail_midpoint']
 
 def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_single=True, generate_pair=True):
     assert traintest in ['train', 'test']
@@ -950,102 +955,103 @@ def robustify(submission, dataset, traintest, traintest_directory=None):
     return submission
 # ==================== MAIN LOOP ====================
 
-submission_list = []
+if __name__ == "__main__":
+    submission_list = []
 
-print(f"XGBoost: {XGBOOST_AVAILABLE}, CatBoost: {CATBOOST_AVAILABLE}\n")
+    print(f"XGBoost: {XGBOOST_AVAILABLE}, CatBoost: {CATBOOST_AVAILABLE}\n")
 
-for section in range(1, len(body_parts_tracked_list)):
-    body_parts_tracked_str = body_parts_tracked_list[section]
-    try:
-        body_parts_tracked = json.loads(body_parts_tracked_str)
-        print(f"{section}. Processing: {len(body_parts_tracked)} body parts")
-        if len(body_parts_tracked) > 5:
-            body_parts_tracked = [b for b in body_parts_tracked if b not in drop_body_parts]
+    for section in range(1, len(body_parts_tracked_list)):
+        body_parts_tracked_str = body_parts_tracked_list[section]
+        try:
+            body_parts_tracked = json.loads(body_parts_tracked_str)
+            print(f"{section}. Processing: {len(body_parts_tracked)} body parts")
+            if len(body_parts_tracked) > 5:
+                body_parts_tracked = [b for b in body_parts_tracked if b not in drop_body_parts]
 
-        train_subset = train[train.body_parts_tracked == body_parts_tracked_str]
+            train_subset = train[train.body_parts_tracked == body_parts_tracked_str]
 
-        _fps_lookup = (
-            train_subset[['video_id', 'frames_per_second']]
-            .drop_duplicates('video_id')
-            .set_index('video_id')['frames_per_second']
-            .to_dict()
-        )
+            _fps_lookup = (
+                train_subset[['video_id', 'frames_per_second']]
+                .drop_duplicates('video_id')
+                .set_index('video_id')['frames_per_second']
+                .to_dict()
+            )
 
-        single_list, single_label_list, single_meta_list = [], [], []
-        pair_list, pair_label_list, pair_meta_list = [], [], []
+            single_list, single_label_list, single_meta_list = [], [], []
+            pair_list, pair_label_list, pair_meta_list = [], [], []
 
-        for switch, data, meta, label in generate_mouse_data(train_subset, 'train'):
-            if switch == 'single':
-                single_list.append(data)
-                single_meta_list.append(meta)
-                single_label_list.append(label)
-            else:
-                pair_list.append(data)
-                pair_meta_list.append(meta)
-                pair_label_list.append(label)
+            for switch, data, meta, label in generate_mouse_data(train_subset, 'train'):
+                if switch == 'single':
+                    single_list.append(data)
+                    single_meta_list.append(meta)
+                    single_label_list.append(label)
+                else:
+                    pair_list.append(data)
+                    pair_meta_list.append(meta)
+                    pair_label_list.append(label)
 
-        if len(single_list) > 0:
-            single_feats_parts = []
-            for data_i, meta_i in zip(single_list, single_meta_list):
-                fps_i = _fps_from_meta(meta_i, _fps_lookup, default_fps=30.0)
-                Xi = transform_single(data_i, body_parts_tracked, fps_i).astype(np.float32)
-                single_feats_parts.append(Xi)
+            if len(single_list) > 0:
+                single_feats_parts = []
+                for data_i, meta_i in zip(single_list, single_meta_list):
+                    fps_i = _fps_from_meta(meta_i, _fps_lookup, default_fps=30.0)
+                    Xi = transform_single(data_i, body_parts_tracked, fps_i).astype(np.float32)
+                    single_feats_parts.append(Xi)
 
-            X_tr = pd.concat(single_feats_parts, axis=0, ignore_index=True)
- 
-            single_label = pd.concat(single_label_list, axis=0, ignore_index=True)
-            single_meta  = pd.concat(single_meta_list,  axis=0, ignore_index=True)
+                X_tr = pd.concat(single_feats_parts, axis=0, ignore_index=True)
 
-            del single_list, single_label_list, single_meta_list, single_feats_parts
-            gc.collect()
+                single_label = pd.concat(single_label_list, axis=0, ignore_index=True)
+                single_meta  = pd.concat(single_meta_list,  axis=0, ignore_index=True)
 
-            print(f"  Single: {X_tr.shape}")
-            submit_ensemble(body_parts_tracked_str, 'single', X_tr, single_label, single_meta, 2_000_000)
+                del single_list, single_label_list, single_meta_list, single_feats_parts
+                gc.collect()
 
-            del X_tr, single_label, single_meta
-            gc.collect()
+                print(f"  Single: {X_tr.shape}")
+                submit_ensemble(body_parts_tracked_str, 'single', X_tr, single_label, single_meta, 2_000_000)
 
-        if len(pair_list) > 0:
-            pair_feats_parts = []
-            for data_i, meta_i in zip(pair_list, pair_meta_list):
-                fps_i = _fps_from_meta(meta_i, _fps_lookup, default_fps=30.0)
-                Xi = transform_pair(data_i, body_parts_tracked, fps_i).astype(np.float32)
-                pair_feats_parts.append(Xi)
+                del X_tr, single_label, single_meta
+                gc.collect()
 
-            X_tr = pd.concat(pair_feats_parts, axis=0, ignore_index=True)
+            if len(pair_list) > 0:
+                pair_feats_parts = []
+                for data_i, meta_i in zip(pair_list, pair_meta_list):
+                    fps_i = _fps_from_meta(meta_i, _fps_lookup, default_fps=30.0)
+                    Xi = transform_pair(data_i, body_parts_tracked, fps_i).astype(np.float32)
+                    pair_feats_parts.append(Xi)
 
-            
-            pair_label = pd.concat(pair_label_list, axis=0, ignore_index=True)
-            pair_meta  = pd.concat(pair_meta_list,  axis=0, ignore_index=True)
+                X_tr = pd.concat(pair_feats_parts, axis=0, ignore_index=True)
 
-            del pair_list, pair_label_list, pair_meta_list, pair_feats_parts
-            gc.collect()
 
-            print(f"  Pair: {X_tr.shape}")
-            submit_ensemble(body_parts_tracked_str, 'pair', X_tr, pair_label, pair_meta, 900_000)
+                pair_label = pd.concat(pair_label_list, axis=0, ignore_index=True)
+                pair_meta  = pd.concat(pair_meta_list,  axis=0, ignore_index=True)
 
-            del X_tr, pair_label, pair_meta
-            gc.collect()
+                del pair_list, pair_label_list, pair_meta_list, pair_feats_parts
+                gc.collect()
 
-    except Exception as e:
-        print(f'***Exception*** {str(e)[:100]}')
+                print(f"  Pair: {X_tr.shape}")
+                submit_ensemble(body_parts_tracked_str, 'pair', X_tr, pair_label, pair_meta, 900_000)
 
-    gc.collect()
-    print()
+                del X_tr, pair_label, pair_meta
+                gc.collect()
 
-if len(submission_list) > 0:
-    submission = pd.concat(submission_list, ignore_index=True)
-else:
-    submission = pd.DataFrame({
-        'video_id': [438887472],
-        'agent_id': ['mouse1'],
-        'target_id': ['self'],
-        'action': ['rear'],
-        'start_frame': [278],
-        'stop_frame': [500]
-    })
+        except Exception as e:
+            print(f'***Exception*** {str(e)[:100]}')
 
-submission_robust = robustify(submission, test, 'test')
-submission_robust.index.name = 'row_id'
-submission_robust.to_csv('submission.csv')
-print(f"\nSubmission created: {len(submission_robust)} predictions")
+        gc.collect()
+        print()
+
+    if len(submission_list) > 0:
+        submission = pd.concat(submission_list, ignore_index=True)
+    else:
+        submission = pd.DataFrame({
+            'video_id': [438887472],
+            'agent_id': ['mouse1'],
+            'target_id': ['self'],
+            'action': ['rear'],
+            'start_frame': [278],
+            'stop_frame': [500]
+        })
+
+    submission_robust = robustify(submission, test, 'test')
+    submission_robust.index.name = 'row_id'
+    submission_robust.to_csv('submission.csv')
+    print(f"\nSubmission created: {len(submission_robust)} predictions")
