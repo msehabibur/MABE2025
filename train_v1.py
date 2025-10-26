@@ -14,6 +14,11 @@ USE_LAB_CV = True  # Cross-validation across labs
 # GPU configuration
 USE_GPU = True  # Set to False to use CPU
 
+
+# Global containers that are populated during training/submission generation.
+# These are initialised eagerly so that any early exception still leaves them defined.
+submission_list = []
+
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
@@ -790,7 +795,10 @@ def train_with_cv(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_sample
         'random_state': SEED,
         'bagging_seed': SEED,
         'feature_fraction_seed': SEED,
-        'data_random_seed': SEED
+        'data_random_seed': SEED,
+        'lambdarank_truncation_level': 10,
+        'min_data_in_leaf': 20,
+        'min_sum_hessian_in_leaf': 1e-3,
     }
     # GPU requires higher min_child_samples to avoid split errors
     min_child_boost = 20 if USE_GPU else 0
@@ -1086,7 +1094,10 @@ def evaluate_lab_cv(X_tr, label, meta, n_samples, body_parts_tracked_str, switch
             'random_state': SEED,
             'bagging_seed': SEED,
             'feature_fraction_seed': SEED,
-            'data_random_seed': SEED
+            'data_random_seed': SEED,
+            'lambdarank_truncation_level': 10,
+            'min_data_in_leaf': 20,
+            'min_sum_hessian_in_leaf': 1e-3,
         }
         min_child_boost = 20 if USE_GPU else 0
 
@@ -1205,11 +1216,21 @@ def evaluate_lab_cv(X_tr, label, meta, n_samples, body_parts_tracked_str, switch
 def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples, use_cv=True, n_folds=5):
     """Train ensemble and make predictions on test set"""
 
+    model_list = []
+    cv_scores = {}
+
     # Use CV or standard training
     if use_cv:
-        model_list, cv_scores = train_with_cv(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples, n_folds)
-        del X_tr
-        gc.collect()
+        try:
+            model_list, cv_scores = train_with_cv(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples, n_folds)
+        except Exception as e:
+            if verbose:
+                print(f"  CV training failed: {str(e)[:80]}")
+            model_list = []
+            cv_scores = {}
+        finally:
+            del X_tr
+            gc.collect()
     else:
         models = []
 
@@ -1219,7 +1240,10 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
             'random_state': SEED,
             'bagging_seed': SEED,
             'feature_fraction_seed': SEED,
-            'data_random_seed': SEED
+            'data_random_seed': SEED,
+            'lambdarank_truncation_level': 10,
+            'min_data_in_leaf': 20,
+            'min_sum_hessian_in_leaf': 1e-3,
         }
         # GPU requires higher min_child_samples to avoid split errors
         min_child_boost = 20 if USE_GPU else 0
