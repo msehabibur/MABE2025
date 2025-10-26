@@ -1081,7 +1081,6 @@ def evaluate_lab_cv(X_tr, label, meta, n_samples, body_parts_tracked_str, switch
         print(f"  Validation samples: {len(val_idx)}")
 
         # Build models for this fold
-        models = []
         lgbm_params_base = {
             'verbose': -1,
             'random_state': SEED,
@@ -1090,18 +1089,40 @@ def evaluate_lab_cv(X_tr, label, meta, n_samples, body_parts_tracked_str, switch
             'data_random_seed': SEED
         }
         min_child_boost = 20 if USE_GPU else 0
-        if USE_GPU:
-            lgbm_params_base.update({'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0})
 
-        models.append(make_pipeline(
-            StratifiedSubsetClassifier(
-                lightgbm.LGBMClassifier(
-                    n_estimators=150, learning_rate=0.1, min_child_samples=20+min_child_boost,
-                    num_leaves=63, subsample=0.8, colsample_bytree=0.8,
-                    **lgbm_params_base
-                ), int(n_samples/2),
+        def _build_model(params: dict) -> BaseEstimator:
+            return make_pipeline(
+                StratifiedSubsetClassifier(
+                    lightgbm.LGBMClassifier(
+                        n_estimators=150,
+                        learning_rate=0.1,
+                        min_child_samples=20 + min_child_boost,
+                        num_leaves=63,
+                        subsample=0.8,
+                        colsample_bytree=0.8,
+                        **params,
+                    ),
+                    int(n_samples / 2),
+                )
             )
-        ))
+
+        # Always prepare a CPU template for fallbacks
+        cpu_params = dict(lgbm_params_base)
+        cpu_params.pop('device', None)
+        cpu_model_template = _build_model(cpu_params)
+
+        models = []
+        if USE_GPU:
+            gpu_params = dict(lgbm_params_base)
+            gpu_params.update({'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0})
+            try:
+                models.append(_build_model(gpu_params))
+            except Exception as e:
+                if verbose:
+                    print(f"  Failed to initialise GPU model: {str(e)[:80]}. Falling back to CPU.")
+
+        if not models:
+            models.append(clone(cpu_model_template))
 
         # Train and evaluate for each action
         action_f1_scores = {}
@@ -1130,7 +1151,8 @@ def evaluate_lab_cv(X_tr, label, meta, n_samples, body_parts_tracked_str, switch
 
             # Train model
             try:
-                m = clone(models[0])
+                base_model = models[0] if models else cpu_model_template
+                m = clone(base_model)
                 m.fit(X_tr_np[idx_train], y_train)
 
                 # Predict on validation
@@ -1146,9 +1168,7 @@ def evaluate_lab_cv(X_tr, label, meta, n_samples, body_parts_tracked_str, switch
                 error_msg = str(e)
                 if 'GPU' in error_msg or 'gpu' in error_msg or 'best_split_info' in error_msg:
                     try:
-                        m_cpu = clone(models[0])
-                        if hasattr(m_cpu.steps[0][1].estimator, 'set_params'):
-                            m_cpu.steps[0][1].estimator.set_params(device='cpu')
+                        m_cpu = clone(cpu_model_template)
                         m_cpu.fit(X_tr_np[idx_train], y_train)
                         y_pred_proba = m_cpu.predict_proba(X_tr_np[idx_val])[:, 1]
                         y_pred = (y_pred_proba > 0.5).astype(int)
