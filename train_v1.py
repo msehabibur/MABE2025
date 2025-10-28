@@ -1,6 +1,7 @@
 # Update of the Taylor S. Amarel and AmbrosM great notebook
 # Removes the constant FPS assumption; handles variable frame timing
-
+# The model underperforms on 'single' targets, so we train on more samples.
+# Added action dependent adaptive threshold map
 validate_or_submit = 'submit'
 verbose = True
 
@@ -16,13 +17,11 @@ import lightgbm
 from collections import defaultdict
 import polars as pl
 from scipy import signal, stats
-
 from sklearn.base import ClassifierMixin, BaseEstimator, clone
 from sklearn.model_selection import cross_val_predict, GroupKFold, StratifiedKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.metrics import f1_score
-
 warnings.filterwarnings('ignore')
 
 # Try importing additional models
@@ -31,20 +30,30 @@ try:
     XGBOOST_AVAILABLE = True
 except:
     XGBOOST_AVAILABLE = False
-    
 try:
     from catboost import CatBoostClassifier
     CATBOOST_AVAILABLE = True
 except:
     CATBOOST_AVAILABLE = False
 
-# --- SEED EVERYTHING -----
-SEED =1234
-os.environ["PYTHONHASHSEED"] = str(SEED)      # has to be set very early
+# Check GPU availability
+GPU_AVAILABLE = False
+try:
+    import torch
+    if torch.cuda.is_available():
+        GPU_AVAILABLE = True
+        print(f"GPU Available: {torch.cuda.get_device_name(0)}")
+        print(f"Number of GPUs: {torch.cuda.device_count()}")
+except:
+    pass
 
+# --- SEED EVERYTHING -----
+SEED = 42
+os.environ["PYTHONHASHSEED"] = str(SEED)      # has to be set very early
 rnd = np.random.RandomState(SEED)
 random.seed(SEED)
 np.random.seed(SEED)
+
 class StratifiedSubsetClassifier(ClassifierMixin, BaseEstimator):
     def __init__(self, estimator, n_samples=None):
         self.estimator = estimator
@@ -73,9 +82,18 @@ class StratifiedSubsetClassifier(ClassifierMixin, BaseEstimator):
             try:
                 idx, _ = next(sss.split(np.zeros_like(y), y))
                 self.estimator.fit(Xn[idx], y[idx])
-            except Exception:
-                step = max(len(Xn) // int(self.n_samples), 1)
-                self.estimator.fit(Xn[::step], y[::step])
+            except Exception as e:
+                if 'best_split_info.left_count' in str(e) and GPU_AVAILABLE:
+                    # Try falling back to CPU if GPU fails (e.g., small sample size)
+                    try:
+                        self.estimator.set_params(device_type='cpu')
+                        self.estimator.fit(Xn[idx], y[idx])
+                    except: # Failsafe
+                        step = max(len(Xn) // int(self.n_samples), 1)
+                        self.estimator.fit(Xn[::step], y[::step])
+                else:
+                    step = max(len(Xn) // int(self.n_samples), 1)
+                    self.estimator.fit(Xn[::step], y[::step])
 
         try:
             self.classes_ = np.asarray(self.estimator.classes_)
@@ -112,8 +130,8 @@ class StratifiedSubsetClassifier(ClassifierMixin, BaseEstimator):
             return self.estimator.predict(Xn)
         except Exception:
             return np.argmax(self.predict_proba(Xn), axis=1)
-# ==================== SCORING FUNCTIONS ====================
 
+# ==================== SCORING FUNCTIONS ====================
 class HostVisibleError(Exception):
     pass
 
@@ -221,14 +239,22 @@ def score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: 
     solution = solution.drop(row_id_column_name, axis='columns', errors='ignore')
     submission = submission.drop(row_id_column_name, axis='columns', errors='ignore')
     return mouse_fbeta(solution, submission, beta=beta)
+
 # ==================== DATA LOADING ====================
+try:
+    train = pd.read_csv('/kaggle/input/MABe-mouse-behavior-detection/train.csv')
+    test = pd.read_csv('/kaggle/input/MABe-mouse-behavior-detection/test.csv')
+    base_dir = '/kaggle/input/MABe-mouse-behavior-detection'
+except FileNotFoundError:
+    print("Running in a local-like environment. Adjusting paths...")
+    # You might need to adjust these paths if running locally
+    train = pd.read_csv('train.csv')
+    test = pd.read_csv('test.csv')
+    base_dir = '.'
 
-train = pd.read_csv('/kaggle/input/MABe-mouse-behavior-detection/train.csv')
+
 train['n_mice'] = 4 - train[['mouse1_strain', 'mouse2_strain', 'mouse3_strain', 'mouse4_strain']].isna().sum(axis=1)
-
-test = pd.read_csv('/kaggle/input/MABe-mouse-behavior-detection/test.csv')
 body_parts_tracked_list = list(np.unique(train.body_parts_tracked))
-
 drop_body_parts = ['headpiece_bottombackleft', 'headpiece_bottombackright', 'headpiece_bottomfrontleft', 'headpiece_bottomfrontright', 
                    'headpiece_topbackleft', 'headpiece_topbackright', 'headpiece_topfrontleft', 'headpiece_topfrontright', 
                    'spine_1', 'spine_2', 'tail_middle_1', 'tail_middle_2', 'tail_midpoint']
@@ -236,7 +262,7 @@ drop_body_parts = ['headpiece_bottombackleft', 'headpiece_bottombackright', 'hea
 def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_single=True, generate_pair=True):
     assert traintest in ['train', 'test']
     if traintest_directory is None:
-        traintest_directory = f"/kaggle/input/MABe-mouse-behavior-detection/{traintest}_tracking"
+        traintest_directory = f"{base_dir}/{traintest}_tracking"
     for _, row in dataset.iterrows():
         
         lab_id = row.lab_id
@@ -247,7 +273,13 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
             continue
 
         path = f"{traintest_directory}/{lab_id}/{video_id}.parquet"
-        vid = pd.read_parquet(path)
+        
+        try:
+            vid = pd.read_parquet(path)
+        except FileNotFoundError:
+            if verbose: print(f"File not found, skipping: {path}")
+            continue
+
         if len(np.unique(vid.bodypart)) > 5:
             vid = vid.query("~ bodypart.isin(@drop_body_parts)")
         pvid = vid.pivot(columns=['mouse_id', 'bodypart'], index='video_frame', values=['x', 'y'])
@@ -266,8 +298,9 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
         
         if traintest == 'train':
             try:
-                annot = pd.read_parquet(path.replace('train_tracking', 'train_annotation'))
+                annot = pd.read_parquet(path.replace(f'{traintest}_tracking', f'{traintest}_annotation'))
             except FileNotFoundError:
+                if verbose: print(f"Annotation not found, skipping: {video_id}")
                 continue
 
         if generate_single:
@@ -324,24 +357,57 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                     else:
                         if verbose: print('- test pair', video_id, agent, target)
                         yield 'pair', mouse_pair, mouse_pair_meta, vid_agent_actions
-# ==================== ADAPTIVE THRESHOLDING ====================
 
-action_thresholds = defaultdict(lambda: 0.27)  # Default threshold
+# ==================== ADAPTIVE THRESHOLDING ====================
+action_thresholds = {
+    "default": 0.27,
+    "single_default": 0.27,
+    "pair_default": 0.27,
+    "single": {
+        "rear": 0.30,
+    },}
+
+def _select_threshold_map(thresholds, mode: str):
+    # same behavior you had, but returns a defaultdict
+    if isinstance(thresholds, dict):
+        # mode-aware?
+        if ("single" in thresholds) or ("pair" in thresholds) or \
+           ("single_default" in thresholds) or ("pair_default" in thresholds):
+            base_default = float(thresholds.get("default", 0.27))
+            mode_default = float(thresholds.get(f"{mode}_default", base_default))
+            mode_overrides = thresholds.get(mode, {}) or {}
+            out = defaultdict(lambda: mode_default)
+            out.update({str(k): float(v) for k, v in mode_overrides.items()})
+            return out
+        # plain per-action dict
+        out = defaultdict(lambda: float(thresholds.get("default", 0.27)))
+        out.update({str(k): float(v) for k, v in thresholds.items() if k != "default"})
+        return out
+    return defaultdict(lambda: 0.27)
 
 def predict_multiclass_adaptive(pred, meta, action_thresholds):
     """Adaptive thresholding per action + temporal smoothing"""
     # Apply temporal smoothing
     pred_smoothed = pred.rolling(window=5, min_periods=1, center=True).mean()
-    
+
+
+    mode = 'pair'
+    try:
+        if 'target_id' in meta.columns and meta['target_id'].eq('self').all():
+            mode = 'single'
+    except Exception:
+        pass
+
     ama = np.argmax(pred_smoothed, axis=1)
-    
+    th_map = _select_threshold_map(action_thresholds, mode)
+
     max_probs = pred_smoothed.max(axis=1)
     threshold_mask = np.zeros(len(pred_smoothed), dtype=bool)
     for i, action in enumerate(pred_smoothed.columns):
         action_mask = (ama == i)
-        threshold = action_thresholds.get(action, 0.27)
+        threshold = th_map[action]
         threshold_mask |= (action_mask & (max_probs >= threshold))
-    
+
     ama = np.where(threshold_mask, ama, -1)
     ama = pd.Series(ama, index=meta.video_frame)
     
@@ -385,8 +451,8 @@ def predict_multiclass_adaptive(pred, meta, action_thresholds):
     
     if verbose: print(f'  actions found: {len(submission_part)}')
     return submission_part
-# ==================== ADVANCED FEATURE ENGINEERING (FPS-AWARE) ====================
 
+# ==================== ADVANCED FEATURE ENGINEERING (FPS-AWARE) ====================
 def safe_rolling(series, window, func, min_periods=None):
     """Safe rolling operation with NaN handling"""
     if min_periods is None:
@@ -415,6 +481,7 @@ def add_curvature_features(X, center_x, center_y, fps):
     """Trajectory curvature (window lengths scaled by fps)."""
     vel_x = center_x.diff()
     vel_y = center_y.diff()
+    
     acc_x = vel_x.diff()
     acc_y = vel_y.diff()
 
@@ -537,6 +604,36 @@ def add_interaction_features(X, mouse_pair, avail_A, avail_B, fps):
 
     return X
 
+def add_facing_features(X, mouse_pair, fps):
+    try:
+        # require nose & tail_base for both
+        if all(p in mouse_pair['A'].columns.get_level_values(0) for p in ['nose','tail_base']) and \
+           all(p in mouse_pair['B'].columns.get_level_values(0) for p in ['nose','tail_base']):
+            A_dir = mouse_pair['A']['nose'] - mouse_pair['A']['tail_base']
+            B_dir = mouse_pair['B']['nose'] - mouse_pair['B']['tail_base']
+
+            # direction vectors normalized
+            A_mag = np.sqrt(A_dir['x']**2 + A_dir['y']**2) + 1e-6
+            B_mag = np.sqrt(B_dir['x']**2 + B_dir['y']**2) + 1e-6
+            A_unit_x = A_dir['x'] / A_mag
+            A_unit_y = A_dir['y'] / A_mag
+            B_unit_x = B_dir['x'] / B_mag
+            B_unit_y = B_dir['y'] / B_mag
+
+            # vector from A to B
+            ABx = (mouse_pair['B']['body_center']['x'] - mouse_pair['A']['body_center']['x'])
+            ABy = (mouse_pair['B']['body_center']['y'] - mouse_pair['A']['body_center']['y'])
+            AB_mag = np.sqrt(ABx**2 + ABy**2) + 1e-6
+
+            # cos(angle between A facing dir and vector to B) -> 1 means A facing B
+            X['A_face_B'] = (A_unit_x * (ABx/AB_mag) + A_unit_y * (ABy/AB_mag)).rolling(_scale(30,fps), min_periods=1, center=True).mean()
+            # and symmetric
+            BAx = -ABx; BAy = -ABy; BA_mag = AB_mag
+            X['B_face_A'] = (B_unit_x * (BAx/BA_mag) + B_unit_y * (BAy/BA_mag)).rolling(_scale(30,fps), min_periods=1, center=True).mean()
+    except Exception:
+        pass
+    return X
+
 def transform_single(single_mouse, body_parts_tracked, fps):
     """Enhanced single mouse transform (FPS-aware windows/lags; distances in cm)."""
     available_body_parts = single_mouse.columns.get_level_values(0)
@@ -571,6 +668,10 @@ def transform_single(single_mouse, body_parts_tracked, fps):
         X['body_ang'] = (v1['x'] * v2['x'] + v1['y'] * v2['y']) / (
             np.sqrt(v1['x']**2 + v1['y']**2) * np.sqrt(v2['x']**2 + v2['y']**2) + 1e-6)
 
+        angle = np.arctan2(v1['y'], v1['x'])
+        body_ang = np.arctan2(v2['y'], v2['x'])
+        X['body_ang_diff'] = np.unwrap(angle - body_ang)  # unwrap reduces angle jumps
+    
     # Core temporal features (windows scaled by fps)
     if 'body_center' in available_body_parts:
         cx = single_mouse['body_center']['x']
@@ -595,6 +696,17 @@ def transform_single(single_mouse, body_parts_tracked, fps):
         X = add_multiscale_features(X, cx, cy, fps)
         X = add_state_features(X, cx, cy, fps)
         X = add_longrange_features(X, cx, cy, fps)
+
+        # NEW: Binary long distance features for 180 frames
+        lag_180 = _scale(180, fps)
+        if len(cx) >= lag_180:
+            # Feature 1: Long-term displacement binary (has mouse moved far from position 180 frames ago?)
+            long_disp = np.sqrt((cx - cx.shift(lag_180))**2 + (cy - cy.shift(lag_180))**2)
+            X['longdist_bin1'] = (long_disp > 20.0).astype(float)  # Binary: moved >20cm in 180 frames
+            
+            # Feature 2: Sustained high activity binary (has activity been consistently high over 180 frames?)
+            speed_180 = np.sqrt(cx.diff()**2 + cy.diff()**2) * float(fps)
+            X['longdist_bin2'] = (speed_180.rolling(lag_180, min_periods=max(5, lag_180 // 6)).mean() > 5.0).astype(float)
 
     # Nose-tail features with duration-aware lags
     if all(p in available_body_parts for p in ['nose', 'tail_base']):
@@ -642,9 +754,10 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
             'sp_B': np.square(mouse_pair['B']['ear_left'] - shB).sum(axis=1, skipna=False),
         })
         X = pd.concat([X, speeds], axis=1)
-
-    if 'nose+tail_base' in X.columns and 'ear_left+ear_right' in X.columns:
-        X['elong'] = X['nose+tail_base'] / (X['ear_left+ear_right'] + 1e-6)
+    
+    # This check seems to be a typo from single_transform, remove
+    # if 'nose+tail_base' in X.columns and 'ear_left+ear_right' in X.columns:
+    #    X['elong'] = X['nose+tail_base'] / (X['ear_left+ear_right'] + 1e-6)
 
     # Relative orientation
     if all(p in avail_A for p in ['nose', 'tail_base']) and all(p in avail_B for p in ['nose', 'tail_base']):
@@ -694,6 +807,16 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
             X[f'co_m{w}'] = coord.rolling(ws, **roll).mean()
             X[f'co_s{w}'] = coord.rolling(ws, **roll).std()
 
+        # NEW: Binary long distance features for 180 frames (pair interactions)
+        lag_180 = _scale(180, fps)
+        if len(cd_full) >= lag_180:
+            # Feature 1: Sustained far distance binary (have mice been consistently far apart for 180 frames?)
+            cd_dist = np.sqrt(cd_full)
+            X['longdist_pair_bin1'] = (cd_dist.rolling(lag_180, min_periods=max(5, lag_180 // 6)).mean() > 30.0).astype(float)
+            
+            # Feature 2: Sustained close proximity binary (have mice been consistently close for 180 frames?)
+            X['longdist_pair_bin2'] = (cd_dist.rolling(lag_180, min_periods=max(5, lag_180 // 6)).mean() < 10.0).astype(float)
+    
     # Nose-nose dynamics (duration-aware lags)
     if 'nose' in avail_A and 'nose' in avail_B:
         nn = np.sqrt((mouse_pair['A']['nose']['x'] - mouse_pair['B']['nose']['x'])**2 +
@@ -723,60 +846,80 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
 
         # Advanced interaction (fps-adjusted internals)
         X = add_interaction_features(X, mouse_pair, avail_A, avail_B, fps)
+        X = add_facing_features(X, mouse_pair, fps)
 
     return X.astype(np.float32, copy=False)
-# ==================== ENSEMBLE TRAINING ====================
 
-def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta):
+# ==================== ENSEMBLE TRAINING WITH GPU SUPPORT ====================
+def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samples):
     models = []
 
+    # Configure GPU device for gradient boosting models
+    gpu_device = 'gpu' if GPU_AVAILABLE else 'cpu'
+    
     models.append(make_pipeline(
         StratifiedSubsetClassifier(
             lightgbm.LGBMClassifier(
-                n_estimators=225, learning_rate=0.07, min_child_samples=40,
+                n_estimators=300, learning_rate=0.07, min_child_samples=40,
                 num_leaves=31, subsample=0.8, colsample_bytree=0.8, verbose=-1,
+                device_type=gpu_device,
                 random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
-            ), 500_000,
+            ), int(n_samples/1.3),
         )
     ))
     models.append(make_pipeline(
         StratifiedSubsetClassifier(
             lightgbm.LGBMClassifier(
-                n_estimators=150, learning_rate=0.1, min_child_samples=20,
+                n_estimators=200, learning_rate=0.1, min_child_samples=20,
                 num_leaves=63, max_depth=8, subsample=0.7, colsample_bytree=0.9,
                 reg_alpha=0.1, reg_lambda=0.1, verbose=-1,
+                device_type=gpu_device,
                 random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
-            ), 450_000,
+            ), int(n_samples/2),
         )
     ))
-    models.append(make_pipeline(
-        StratifiedSubsetClassifier(
-            lightgbm.LGBMClassifier(
-                n_estimators=100, learning_rate=0.05, min_child_samples=30,
-                num_leaves=127, max_depth=10, subsample=0.75, verbose=-1,
-                random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
-            ), 400_000,
-        )
-    ))
+    # models.append(make_pipeline(
+    #     StratifiedSubsetClassifier(
+    #         lightgbm.LGBMClassifier(
+    #             n_estimators=100, learning_rate=0.05, min_child_samples=30,
+    #             num_leaves=127, max_depth=10, subsample=0.75, verbose=-1,
+    #             device=gpu_device,
+    #             random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
+    #         ), int(n_samples/3),
+    #     )
+    # ))
     if XGBOOST_AVAILABLE:
+        xgb_device = 'gpu_hist' if GPU_AVAILABLE else 'hist'
         models.append(make_pipeline(
             StratifiedSubsetClassifier(
                 XGBClassifier(
-                    n_estimators=180, learning_rate=0.08, max_depth=6,
+                    n_estimators=200, learning_rate=0.08, max_depth=6,
                     min_child_weight=5, subsample=0.8, colsample_bytree=0.8,
-                    tree_method='hist', verbosity=0,
+                    tree_method=xgb_device, verbosity=0,
                     random_state=SEED
-                ), 500_000,
+                ), int(n_samples/1.5),
             )
         ))
     if CATBOOST_AVAILABLE:
+        cat_device = 'GPU' if GPU_AVAILABLE else 'CPU'
         models.append(make_pipeline(
             StratifiedSubsetClassifier(
                 CatBoostClassifier(
-                    iterations=120, learning_rate=0.1, depth=6,
+                    iterations=250, learning_rate=0.1, depth=6,
+                    task_type=cat_device,
                     verbose=False, allow_writing_files=False,
                     random_seed=SEED
-                ), 500_000,
+                ), n_samples,
+            )
+        ))
+        models.append(make_pipeline(
+            StratifiedSubsetClassifier(
+                CatBoostClassifier(
+                    iterations=200, learning_rate=0.1, depth=6,
+                    task_type=cat_device,
+                    verbose=False, allow_writing_files=False,
+                    random_seed=SEED
+                ), n_samples,
             )
         ))
 
@@ -837,7 +980,26 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta):
             for action, trained in model_list:
                 if action in actions_te:
                     probs = [m.predict_proba(X_te_np)[:, 1] for m in trained]
-                    pred[action] = np.mean(probs, axis=0)
+                    n_models_trained = len(probs)
+                    
+                    # Define weights based on the actual number of models trained
+                    # This logic assumes a specific order of models being added
+                    weights = []
+                    if n_models_trained == 5: # LGBM1, LGBM2, XGB, CB1, CB2
+                        weights = [0.20, 0.18, 0.20, 0.22, 0.20]
+                    elif n_models_trained == 4: # e.g. no XGB
+                        weights = [0.25, 0.20, 0.27, 0.28] # Guess
+                    elif n_models_trained == 2: # e.g. only LGBMs
+                        weights = [0.5, 0.5]
+                    # Add more fallbacks if needed
+
+                    if len(weights) == n_models_trained:
+                        pred[action] = np.average(probs, axis=0, weights=weights)
+                    else:
+                        if verbose and n_models_trained > 0:
+                            print(f"  Weight mismatch! {n_models_trained} models, {len(weights)} weights. Using mean.")
+                        pred[action] = np.mean(probs, axis=0) # Fallback to mean
+
 
             del X_te_np; gc.collect()
 
@@ -858,10 +1020,20 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta):
             gc.collect()
 
 def robustify(submission, dataset, traintest, traintest_directory=None):
+    """Robustify submission with proper NaN handling"""
     if traintest_directory is None:
-        traintest_directory = f"/kaggle/input/MABe-mouse-behavior-detection/{traintest}_tracking"
+        traintest_directory = f"{base_dir}/{traintest}_tracking"
 
-    submission = submission[submission.start_frame < submission.stop_frame]
+    # Filter out invalid rows
+    submission = submission[submission.start_frame < submission.stop_frame].copy()
+    
+    # Remove any rows with NaN values
+    submission = submission.dropna(subset=['video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
+    
+    # Ensure frame numbers are integers
+    submission['start_frame'] = submission['start_frame'].astype(int)
+    submission['stop_frame'] = submission['stop_frame'].astype(int)
+    submission['video_id'] = submission['video_id'].astype(int)
 
     group_list = []
     for _, group in submission.groupby(['video_id', 'agent_id', 'target_id']):
@@ -874,35 +1046,80 @@ def robustify(submission, dataset, traintest, traintest_directory=None):
             else:
                 last_stop = row['stop_frame']
         group_list.append(group[mask])
-    submission = pd.concat(group_list) if group_list else submission
 
+    if len(group_list) > 0:
+        submission = pd.concat(group_list, ignore_index=True)
+    else:
+        submission = pd.DataFrame(columns=['video_id', 'agent_id', 'target_id', 'action', 'start_frame', 'stop_frame'])
+
+    batch_len = 200
     s_list = []
-    for _, row in dataset.iterrows():
-        lab_id = row['lab_id']
-        video_id = row['video_id']
-        if (submission.video_id == video_id).any():
+
+    for video_id in dataset.video_id.unique():
+        video_id_int = int(video_id)
+        vid_sub = submission[submission.video_id == video_id_int]
+        lab_id_series = dataset[dataset.video_id == video_id_int].lab_id
+        if lab_id_series.empty:
+            continue # video_id from test set not found
+        lab_id = lab_id_series.iloc[0]
+        path = f"{traintest_directory}/{lab_id}/{video_id_int}.parquet"
+        
+        try:
+            vid = pd.read_parquet(path)
+        except Exception:
+            if verbose: print(f"Robustify: could not read {path}")
             continue
-
-        if verbose:
-            print(f"Video {video_id} has no predictions")
-
-        path = f"{traintest_directory}/{lab_id}/{video_id}.parquet"
-        vid = pd.read_parquet(path)
-
-        vid_behaviors = eval(row['behaviors_labeled'])
-        vid_behaviors = sorted(list({b.replace("'", "") for b in vid_behaviors}))
-        vid_behaviors = [b.split(',') for b in vid_behaviors]
-        vid_behaviors = pd.DataFrame(vid_behaviors, columns=['agent', 'target', 'action'])
-
+            
         start_frame = vid.video_frame.min()
         stop_frame = vid.video_frame.max() + 1
 
-        for (agent, target), actions in vid_behaviors.groupby(['agent', 'target']):
-            batch_len = int(np.ceil((stop_frame - start_frame) / len(actions)))
-            for i, (_, action_row) in enumerate(actions.iterrows()):
-                batch_start = start_frame + i * batch_len
-                batch_stop = min(batch_start + batch_len, stop_frame)
-                s_list.append((video_id, agent, target, action_row['action'], batch_start, batch_stop))
+        all_agents_targets = set()
+        for agent in vid.mouse_id.unique():
+            all_agents_targets.add((f'mouse{agent}', 'self'))
+            for target in vid.mouse_id.unique():
+                if agent != target:
+                    all_agents_targets.add((f'mouse{agent}', f'mouse{target}'))
+
+        for agent, target in all_agents_targets:
+            actions = vid_sub[(vid_sub.agent_id == agent) & (vid_sub.target_id == target)]
+            if len(actions) == 0:
+                for i in range((stop_frame - start_frame + batch_len - 1) // batch_len):
+                    batch_start = start_frame + i * batch_len
+                    batch_stop = min(batch_start + batch_len, stop_frame)
+                    s_list.append((video_id_int, agent, target, 'other', batch_start, batch_stop))
+            else:
+                covered = set()
+                for _, action_row in actions.iterrows():
+                    covered.update(range(int(action_row['start_frame']), int(action_row['stop_frame'])))
+
+                uncovered = set(range(start_frame, stop_frame)) - covered
+                if len(uncovered) > 0:
+                    uncovered_sorted = sorted(uncovered)
+                    gap_start = uncovered_sorted[0]
+                    for j in range(1, len(uncovered_sorted)):
+                        if uncovered_sorted[j] != uncovered_sorted[j-1] + 1:
+                            gap_stop = uncovered_sorted[j-1] + 1
+                            for k in range((gap_stop - gap_start + batch_len - 1) // batch_len):
+                                batch_start = gap_start + k * batch_len
+                                batch_stop = min(batch_start + batch_len, gap_stop)
+                                s_list.append((video_id_int, agent, target, 'other', batch_start, batch_stop))
+                            gap_start = uncovered_sorted[j]
+                    gap_stop = uncovered_sorted[-1] + 1
+                    for k in range((gap_stop - gap_start + batch_len - 1) // batch_len):
+                        batch_start = gap_start + k * batch_len
+                        batch_stop = min(batch_start + batch_len, gap_stop)
+                        s_list.append((video_id_int, agent, target, 'other', batch_start, batch_stop))
+                else:
+                    # This else block seems incorrect - if fully covered, we don't need 'other'
+                    # But the original logic added... action rows?
+                    # Replicating original logic, but it seems suspicious
+                    for i, (_, action_row) in enumerate(actions.iterrows()):
+                        batch_start = start_frame + i * batch_len
+                        batch_stop = min(batch_start + batch_len, stop_frame)
+                        # This part is strange - it's re-adding predicted actions
+                        # but with arbitrary frames.
+                        # s_list.append((video_id_int, agent, target, action_row['action'], batch_start, batch_stop))
+                    pass # A fully-covered pair should not add 'other'
 
     if len(s_list) > 0:
         submission = pd.concat([
@@ -911,13 +1128,17 @@ def robustify(submission, dataset, traintest, traintest_directory=None):
         ])
 
     submission = submission.reset_index(drop=True)
+    
+    # Final cleanup - ensure all values are proper types
+    submission['video_id'] = submission['video_id'].astype(int)
+    submission['start_frame'] = submission['start_frame'].astype(int)
+    submission['stop_frame'] = submission['stop_frame'].astype(int)
+    
     return submission
+
 # ==================== MAIN LOOP ====================
-
 submission_list = []
-
 print(f"XGBoost: {XGBOOST_AVAILABLE}, CatBoost: {CATBOOST_AVAILABLE}\n")
-
 for section in range(1, len(body_parts_tracked_list)):
     body_parts_tracked_str = body_parts_tracked_list[section]
     try:
@@ -964,7 +1185,7 @@ for section in range(1, len(body_parts_tracked_list)):
             gc.collect()
 
             print(f"  Single: {X_tr.shape}")
-            submit_ensemble(body_parts_tracked_str, 'single', X_tr, single_label, single_meta)
+            submit_ensemble(body_parts_tracked_str, 'single', X_tr, single_label, single_meta, 2_000_000)
 
             del X_tr, single_label, single_meta
             gc.collect()
@@ -986,7 +1207,7 @@ for section in range(1, len(body_parts_tracked_list)):
             gc.collect()
 
             print(f"  Pair: {X_tr.shape}")
-            submit_ensemble(body_parts_tracked_str, 'pair', X_tr, pair_label, pair_meta)
+            submit_ensemble(body_parts_tracked_str, 'pair', X_tr, pair_label, pair_meta, 900_000)
 
             del X_tr, pair_label, pair_meta
             gc.collect()
@@ -1009,7 +1230,13 @@ else:
         'stop_frame': [500]
     })
 
+# This is the line that was fixed:
 submission_robust = robustify(submission, test, 'test')
+
 submission_robust.index.name = 'row_id'
 submission_robust.to_csv('submission.csv')
 print(f"\nSubmission created: {len(submission_robust)} predictions")
+
+
+
+Submission created: 2231 predictions
