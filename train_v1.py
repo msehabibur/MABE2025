@@ -1,7 +1,3 @@
-# Update of the Taylor S. Amarel and AmbrosM great notebook
-# Removes the constant FPS assumption; handles variable frame timing
-# The model underperforms on 'single' targets, so we train on more samples.
-# Added action dependent adaptive threshold map
 validate_or_submit = 'submit'
 verbose = True
 
@@ -150,7 +146,7 @@ def single_lab_f1(lab_solution: pl.DataFrame, lab_submission: pl.DataFrame, beta
         for row in lab_submission.filter(pl.col('video_id') == video).to_dicts():
             if ','.join([str(row['agent_id']), str(row['target_id']), row['action']]) not in active_labels:
                 continue
-           
+            
             new_frames = set(range(row['start_frame'], row['stop_frame']))
             new_frames = new_frames.difference(prediction_frames[row['prediction_key']])
             prediction_pair = ','.join([str(row['agent_id']), str(row['target_id'])])
@@ -254,6 +250,19 @@ except FileNotFoundError:
 
 
 train['n_mice'] = 4 - train[['mouse1_strain', 'mouse2_strain', 'mouse3_strain', 'mouse4_strain']].isna().sum(axis=1)
+
+### CHANGE 4 START ###
+# Add n_mice to test set as well
+test['n_mice'] = 4 - test[['mouse1_strain', 'mouse2_strain', 'mouse3_strain', 'mouse4_strain']].isna().sum(axis=1)
+
+# Create a combined map for n_mice for both train and test
+n_mice_map = pd.concat([
+    train[['video_id', 'n_mice']].drop_duplicates('video_id'),
+    test[['video_id', 'n_mice']].drop_duplicates('video_id')
+]).set_index('video_id')['n_mice']
+### CHANGE 4 END ###
+
+
 body_parts_tracked_list = list(np.unique(train.body_parts_tracked))
 drop_body_parts = ['headpiece_bottombackleft', 'headpiece_bottombackright', 'headpiece_bottomfrontleft', 'headpiece_bottomfrontright', 
                    'headpiece_topbackleft', 'headpiece_topbackright', 'headpiece_topfrontleft', 'headpiece_topfrontright', 
@@ -359,13 +368,27 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                         yield 'pair', mouse_pair, mouse_pair_meta, vid_agent_actions
 
 # ==================== ADAPTIVE THRESHOLDING ====================
+### CHANGE 1 START ###
+# Use the new, more detailed threshold map
 action_thresholds = {
     "default": 0.27,
     "single_default": 0.27,
     "pair_default": 0.27,
     "single": {
         "rear": 0.30,
-    },}
+        "groom": 0.29,
+        "investigate": 0.31,
+    },
+    "pair": {
+        "mount": 0.35,
+        "attack": 0.32,
+        "groom": 0.30,
+        "follow": 0.28,
+        "investigate": 0.30,
+    }
+}
+### CHANGE 1 END ###
+
 
 def _select_threshold_map(thresholds, mode: str):
     # same behavior you had, but returns a defaultdict
@@ -444,7 +467,9 @@ def predict_multiclass_adaptive(pred, meta, action_thresholds):
     
     # Filter out very short events (likely noise)
     duration = submission_part.stop_frame - submission_part.start_frame
-    submission_part = submission_part[duration >= 3].reset_index(drop=True)
+    ### CHANGE 7 START ###
+    submission_part = submission_part[duration >= 2].reset_index(drop=True)
+    ### CHANGE 7 END ###
     
     if len(submission_part) > 0:
         assert (submission_part.stop_frame > submission_part.start_frame).all(), 'stop <= start'
@@ -505,6 +530,14 @@ def add_multiscale_features(X, center_x, center_y, fps):
     """Multi-scale temporal features (speed in cm/s; windows scaled by fps)."""
     # displacement per frame is already in cm (pix normalized earlier); convert to cm/s
     speed = np.sqrt(center_x.diff()**2 + center_y.diff()**2) * float(fps)
+
+    ### CHANGE 5 START ###
+    # Add short-term acceleration features
+    acceleration = speed.diff()
+    ws_acc = _scale(15, fps)
+    X['acc_mean_15'] = acceleration.rolling(ws_acc, min_periods=max(1, ws_acc // 4)).mean()
+    X['acc_std_15'] = acceleration.rolling(ws_acc, min_periods=max(1, ws_acc // 4)).std()
+    ### CHANGE 5 END ###
 
     scales = [10, 40, 160]
     for scale in scales:
@@ -687,9 +720,9 @@ def transform_single(single_mouse, body_parts_tracked, fps):
             X[f'x_rng{w}'] = cx.rolling(ws, **roll).max() - cx.rolling(ws, **roll).min()
             X[f'y_rng{w}'] = cy.rolling(ws, **roll).max() - cy.rolling(ws, **roll).min()
             X[f'disp{w}'] = np.sqrt(cx.diff().rolling(ws, min_periods=1).sum()**2 +
-                                     cy.diff().rolling(ws, min_periods=1).sum()**2)
+                                      cy.diff().rolling(ws, min_periods=1).sum()**2)
             X[f'act{w}'] = np.sqrt(cx.diff().rolling(ws, min_periods=1).var() +
-                                   cy.diff().rolling(ws, min_periods=1).var())
+                                     cy.diff().rolling(ws, min_periods=1).var())
 
         # Advanced features (fps-scaled)
         X = add_curvature_features(X, cx, cy, fps)
@@ -720,7 +753,7 @@ def transform_single(single_mouse, body_parts_tracked, fps):
     # Ear features with duration-aware offsets
     if all(p in available_body_parts for p in ['ear_left', 'ear_right']):
         ear_d = np.sqrt((single_mouse['ear_left']['x'] - single_mouse['ear_right']['x'])**2 +
-                        (single_mouse['ear_left']['y'] - single_mouse['ear_right']['y'])**2)
+                          (single_mouse['ear_left']['y'] - single_mouse['ear_right']['y'])**2)
         for off in [-20, -10, 10, 20]:
             o = _scale_signed(off, fps)
             X[f'ear_o{off}'] = ear_d.shift(-o)  
@@ -778,7 +811,7 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
     # Distance bins (cm; unchanged by fps)
     if 'body_center' in avail_A and 'body_center' in avail_B:
         cd = np.sqrt((mouse_pair['A']['body_center']['x'] - mouse_pair['B']['body_center']['x'])**2 +
-                     (mouse_pair['A']['body_center']['y'] - mouse_pair['B']['body_center']['y'])**2)
+                       (mouse_pair['A']['body_center']['y'] - mouse_pair['B']['body_center']['y'])**2)
         X['v_cls'] = (cd < 5.0).astype(float)
         X['cls']   = ((cd >= 5.0) & (cd < 15.0)).astype(float)
         X['med']   = ((cd >= 15.0) & (cd < 30.0)).astype(float)
@@ -820,7 +853,7 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
     # Nose-nose dynamics (duration-aware lags)
     if 'nose' in avail_A and 'nose' in avail_B:
         nn = np.sqrt((mouse_pair['A']['nose']['x'] - mouse_pair['B']['nose']['x'])**2 +
-                     (mouse_pair['A']['nose']['y'] - mouse_pair['B']['nose']['y'])**2)
+                       (mouse_pair['A']['nose']['y'] - mouse_pair['B']['nose']['y'])**2)
         for lag in [10, 20, 40]:
             l = _scale(lag, fps)
             X[f'nn_lg{lag}']  = nn.shift(l)
@@ -847,6 +880,16 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
         # Advanced interaction (fps-adjusted internals)
         X = add_interaction_features(X, mouse_pair, avail_A, avail_B, fps)
         X = add_facing_features(X, mouse_pair, fps)
+
+    ### CHANGE 3 START ###
+    # Filter (zero-out features) for frames where mice are impossibly far apart
+    if 'body_center' in avail_A and 'body_center' in avail_B:
+        dist = np.sqrt((mouse_pair['A']['body_center']['x'] - mouse_pair['B']['body_center']['x'])**2 +
+                       (mouse_pair['A']['body_center']['y'] - mouse_pair['B']['body_center']['y'])**2)
+        invalid_mask = (dist > 50.0)
+        if invalid_mask.any():
+            X.loc[invalid_mask] = 0.0  # Zero out all features for these frames
+    ### CHANGE 3 END ###
 
     return X.astype(np.float32, copy=False)
 
@@ -879,14 +922,14 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
         )
     ))
     # models.append(make_pipeline(
-    #     StratifiedSubsetClassifier(
-    #         lightgbm.LGBMClassifier(
-    #             n_estimators=100, learning_rate=0.05, min_child_samples=30,
-    #             num_leaves=127, max_depth=10, subsample=0.75, verbose=-1,
-    #             device=gpu_device,
-    #             random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
-    #         ), int(n_samples/3),
-    #     )
+    #    StratifiedSubsetClassifier(
+    #        lightgbm.LGBMClassifier(
+    #            n_estimators=100, learning_rate=0.05, min_child_samples=30,
+    #            num_leaves=127, max_depth=10, subsample=0.75, verbose=-1,
+    #            device=gpu_device,
+    #            random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
+    #        ), int(n_samples/3),
+    #    )
     # ))
     if XGBOOST_AVAILABLE:
         xgb_device = 'gpu_hist' if GPU_AVAILABLE else 'hist'
@@ -973,6 +1016,11 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
             else:
                 X_te = transform_pair(data_te, body_parts_tracked, fps_i).astype(np.float32)
 
+            ### CHANGE 4 START ###
+            # Add n_mice feature to the test set features
+            X_te['n_mice'] = meta_te['video_id'].map(n_mice_map).fillna(4).values
+            ### CHANGE 4 END ###
+
             X_te_np = X_te.to_numpy(np.float32, copy=False)
             del X_te, data_te; gc.collect()
 
@@ -986,19 +1034,31 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
                     # This logic assumes a specific order of models being added
                     weights = []
                     if n_models_trained == 5: # LGBM1, LGBM2, XGB, CB1, CB2
-                        weights = [0.20, 0.18, 0.20, 0.22, 0.20]
+                        ### CHANGE 2 START ###
+                        weights = [0.15, 0.15, 0.2, 0.25, 0.25]
+                        ### CHANGE 2 END ###
                     elif n_models_trained == 4: # e.g. no XGB
                         weights = [0.25, 0.20, 0.27, 0.28] # Guess
                     elif n_models_trained == 2: # e.g. only LGBMs
                         weights = [0.5, 0.5]
                     # Add more fallbacks if needed
 
+                    ### CHANGE 6 START ###
+                    # Use median ensembling as a fallback for high disagreement
+                    probs_array = np.asarray(probs)
                     if len(weights) == n_models_trained:
-                        pred[action] = np.average(probs, axis=0, weights=weights)
+                        if np.std(probs_array, axis=0).mean() > 0.2:  # High disagreement
+                            pred[action] = np.median(probs_array, axis=0)
+                        else:
+                            pred[action] = np.average(probs_array, axis=0, weights=weights)
                     else:
                         if verbose and n_models_trained > 0:
-                            print(f"  Weight mismatch! {n_models_trained} models, {len(weights)} weights. Using mean.")
-                        pred[action] = np.mean(probs, axis=0) # Fallback to mean
+                            print(f"  Weight mismatch! {n_models_trained} models, {len(weights)} weights. Using mean/median fallback.")
+                        if np.std(probs_array, axis=0).mean() > 0.2:  # High disagreement
+                            pred[action] = np.median(probs_array, axis=0)
+                        else:
+                            pred[action] = np.mean(probs_array, axis=0) # Fallback to mean
+                    ### CHANGE 6 END ###
 
 
             del X_te_np; gc.collect()
@@ -1181,6 +1241,11 @@ for section in range(1, len(body_parts_tracked_list)):
             single_label = pd.concat(single_label_list, axis=0, ignore_index=True)
             single_meta  = pd.concat(single_meta_list,  axis=0, ignore_index=True)
 
+            ### CHANGE 4 START ###
+            # Add n_mice feature to the training set features
+            X_tr['n_mice'] = single_meta['video_id'].map(n_mice_map).fillna(4).values
+            ### CHANGE 4 END ###
+
             del single_list, single_label_list, single_meta_list, single_feats_parts
             gc.collect()
 
@@ -1202,6 +1267,11 @@ for section in range(1, len(body_parts_tracked_list)):
             
             pair_label = pd.concat(pair_label_list, axis=0, ignore_index=True)
             pair_meta  = pd.concat(pair_meta_list,  axis=0, ignore_index=True)
+
+            ### CHANGE 4 START ###
+            # Add n_mice feature to the training set features
+            X_tr['n_mice'] = pair_meta['video_id'].map(n_mice_map).fillna(4).values
+            ### CHANGE 4 END ###
 
             del pair_list, pair_label_list, pair_meta_list, pair_feats_parts
             gc.collect()
@@ -1236,7 +1306,3 @@ submission_robust = robustify(submission, test, 'test')
 submission_robust.index.name = 'row_id'
 submission_robust.to_csv('submission.csv')
 print(f"\nSubmission created: {len(submission_robust)} predictions")
-
-
-
-Submission created: 2231 predictions
