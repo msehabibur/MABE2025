@@ -371,20 +371,20 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
 ### CHANGE 1 START ###
 # Use the new, more detailed threshold map
 action_thresholds = {
-    "default": 0.27,
-    "single_default": 0.27,
-    "pair_default": 0.27,
+    "default": 0.25,
+    "single_default": 0.25,
+    "pair_default": 0.25,
     "single": {
-        "rear": 0.30,
-        "groom": 0.29,
-        "investigate": 0.31,
+        "rear": 0.27,
+        "groom": 0.26,
+        "investigate": 0.28,
     },
     "pair": {
-        "mount": 0.35,
-        "attack": 0.32,
-        "groom": 0.30,
-        "follow": 0.28,
-        "investigate": 0.30,
+        "mount": 0.32,
+        "attack": 0.29,
+        "groom": 0.27,
+        "follow": 0.25,
+        "investigate": 0.27,
     }
 }
 ### CHANGE 1 END ###
@@ -468,7 +468,7 @@ def predict_multiclass_adaptive(pred, meta, action_thresholds):
     # Filter out very short events (likely noise)
     duration = submission_part.stop_frame - submission_part.start_frame
     ### CHANGE 7 START ###
-    submission_part = submission_part[duration >= 2].reset_index(drop=True)
+    submission_part = submission_part[duration >= 1].reset_index(drop=True)
     ### CHANGE 7 END ###
     
     if len(submission_part) > 0:
@@ -903,8 +903,8 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
     models.append(make_pipeline(
         StratifiedSubsetClassifier(
             lightgbm.LGBMClassifier(
-                n_estimators=300, learning_rate=0.07, min_child_samples=40,
-                num_leaves=31, subsample=0.8, colsample_bytree=0.8, verbose=-1,
+                n_estimators=350, learning_rate=0.075, min_child_samples=35,
+                num_leaves=31, subsample=0.82, colsample_bytree=0.82, verbose=-1,
                 device_type=gpu_device,
                 random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
             ), int(n_samples/1.3),
@@ -913,31 +913,31 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
     models.append(make_pipeline(
         StratifiedSubsetClassifier(
             lightgbm.LGBMClassifier(
-                n_estimators=200, learning_rate=0.1, min_child_samples=20,
-                num_leaves=63, max_depth=8, subsample=0.7, colsample_bytree=0.9,
-                reg_alpha=0.1, reg_lambda=0.1, verbose=-1,
+                n_estimators=225, learning_rate=0.095, min_child_samples=18,
+                num_leaves=63, max_depth=8, subsample=0.72, colsample_bytree=0.88,
+                reg_alpha=0.08, reg_lambda=0.08, verbose=-1,
                 device_type=gpu_device,
                 random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
             ), int(n_samples/2),
         )
     ))
-    # models.append(make_pipeline(
-    #    StratifiedSubsetClassifier(
-    #        lightgbm.LGBMClassifier(
-    #            n_estimators=100, learning_rate=0.05, min_child_samples=30,
-    #            num_leaves=127, max_depth=10, subsample=0.75, verbose=-1,
-    #            device=gpu_device,
-    #            random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
-    #        ), int(n_samples/3),
-    #    )
-    # ))
+    models.append(make_pipeline(
+        StratifiedSubsetClassifier(
+            lightgbm.LGBMClassifier(
+                n_estimators=150, learning_rate=0.06, min_child_samples=30,
+                num_leaves=127, max_depth=10, subsample=0.75, verbose=-1,
+                device_type=gpu_device,
+                random_state=SEED, bagging_seed=SEED, feature_fraction_seed=SEED, data_random_seed=SEED
+            ), int(n_samples/3),
+        )
+    ))
     if XGBOOST_AVAILABLE:
         xgb_device = 'gpu_hist' if GPU_AVAILABLE else 'hist'
         models.append(make_pipeline(
             StratifiedSubsetClassifier(
                 XGBClassifier(
-                    n_estimators=200, learning_rate=0.08, max_depth=6,
-                    min_child_weight=5, subsample=0.8, colsample_bytree=0.8,
+                    n_estimators=225, learning_rate=0.085, max_depth=6,
+                    min_child_weight=4, subsample=0.82, colsample_bytree=0.82,
                     tree_method=xgb_device, verbosity=0,
                     random_state=SEED
                 ), int(n_samples/1.5),
@@ -948,7 +948,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
         models.append(make_pipeline(
             StratifiedSubsetClassifier(
                 CatBoostClassifier(
-                    iterations=250, learning_rate=0.1, depth=6,
+                    iterations=275, learning_rate=0.095, depth=6,
                     task_type=cat_device,
                     verbose=False, allow_writing_files=False,
                     random_seed=SEED
@@ -958,7 +958,7 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
         models.append(make_pipeline(
             StratifiedSubsetClassifier(
                 CatBoostClassifier(
-                    iterations=200, learning_rate=0.1, depth=6,
+                    iterations=225, learning_rate=0.095, depth=6,
                     task_type=cat_device,
                     verbose=False, allow_writing_files=False,
                     random_seed=SEED
@@ -1033,13 +1033,17 @@ def submit_ensemble(body_parts_tracked_str, switch_tr, X_tr, label, meta, n_samp
                     # Define weights based on the actual number of models trained
                     # This logic assumes a specific order of models being added
                     weights = []
-                    if n_models_trained == 5: # LGBM1, LGBM2, XGB, CB1, CB2
+                    if n_models_trained == 6: # LGBM1, LGBM2, LGBM3, XGB, CB1, CB2
                         ### CHANGE 2 START ###
-                        weights = [0.15, 0.15, 0.2, 0.25, 0.25]
+                        weights = [0.14, 0.14, 0.12, 0.18, 0.21, 0.21]
                         ### CHANGE 2 END ###
-                    elif n_models_trained == 4: # e.g. no XGB
-                        weights = [0.25, 0.20, 0.27, 0.28] # Guess
-                    elif n_models_trained == 2: # e.g. only LGBMs
+                    elif n_models_trained == 5: # e.g. no XGB: LGBM1, LGBM2, LGBM3, CB1, CB2
+                        weights = [0.17, 0.17, 0.15, 0.255, 0.255]
+                    elif n_models_trained == 4: # e.g. no XGB, no CB2
+                        weights = [0.25, 0.20, 0.20, 0.35]
+                    elif n_models_trained == 3: # e.g. only LGBMs
+                        weights = [0.35, 0.35, 0.30]
+                    elif n_models_trained == 2: # e.g. only first 2 LGBMs
                         weights = [0.5, 0.5]
                     # Add more fallbacks if needed
 
