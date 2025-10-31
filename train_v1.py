@@ -3,13 +3,15 @@ from sklearn.metrics import f1_score
 from sklearn.base import clone
 from xgboost import XGBClassifier
 from tqdm.notebook import tqdm
-from koolbox import Trainer
+import pandas as pd
 import numpy as np
+import json
 import itertools
 import warnings
 import optuna
 import joblib
 import glob
+import os
 import gc
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -611,19 +613,27 @@ def cross_validate_classifier(X, label, meta, body_parts_tracked_str, section):
                 with warnings.catch_warnings():
                     warnings.filterwarnings('ignore', category=RuntimeWarning)
                     
-                    trainer = Trainer(
-                        estimator=clone(CFG.model),
-                        cv=CFG.cv,
-                        cv_args={"groups": groups_action},
-                        metric=f1_score,
-                        task="binary",
-                        verbose=False,
-                        save=True,
-                        save_path=f"{CFG.model_name}/{section}/{action}"
-                    )
+                    # Manual cross-validation loop to replace koolbox Trainer
+                    oof_action = np.zeros(len(y_action))
+                    save_path = f"{CFG.model_name}/{section}/{action}"
+                    os.makedirs(save_path, exist_ok=True)
 
-                    trainer.fit(X_action, y_action)
-                    oof_action = trainer.oof_preds
+                    for fold_idx, (train_idx, val_idx) in enumerate(CFG.cv.split(X_action, y_action, groups=groups_action)):
+                        # Clone model for this fold
+                        fold_model = clone(CFG.model)
+
+                        # Get train and validation data
+                        X_train, X_val = X_action.iloc[train_idx], X_action.iloc[val_idx]
+                        y_train, y_val = y_action[train_idx], y_action[val_idx]
+
+                        # Train the model
+                        fold_model.fit(X_train, y_train)
+
+                        # Predict on validation set
+                        oof_action[val_idx] = fold_model.predict_proba(X_val)[:, 1]
+
+                        # Save the fold model
+                        joblib.dump(fold_model, f"{save_path}/fold_{fold_idx}_trainer_model.pkl")
 
                     threshold = tune_threshold(oof_action, y_action)
                     thresholds[action] = threshold
@@ -635,8 +645,8 @@ def cross_validate_classifier(X, label, meta, body_parts_tracked_str, section):
                     joblib.dump(threshold, f"{CFG.model_name}/{section}/{action}/threshold.pkl")
                     
                     print(f"\tF1: {f1:.4f} ({threshold:.2f}) Section: {section} Action: {action}")
-    
-                    del trainer
+
+                    del fold_model
                     gc.collect()
 
             except Exception as e:
@@ -693,12 +703,16 @@ def submit(body_parts_tracked_str, switch_tr, section, thresholds):
     
             pred = pd.DataFrame(index=meta_te.video_frame)
             for action in actions_te:
-                files = glob.glob(f"{CFG.model_path}/{CFG.model_name}/{section}/{action}/*_trainer_*.pkl")
-                if len(files) == 1:
-                    trainer = joblib.load(files[0])
-                    pred[action] = trainer.predict(X_te)
-                
-                    del trainer
+                files = glob.glob(f"{CFG.model_path}/{CFG.model_name}/{section}/{action}/fold_*_trainer_model.pkl")
+                if len(files) > 0:
+                    # Average predictions from all folds
+                    fold_preds = []
+                    for file in files:
+                        fold_model = joblib.load(file)
+                        fold_preds.append(fold_model.predict_proba(X_te)[:, 1])
+                        del fold_model
+                    pred[action] = np.mean(fold_preds, axis=0)
+                    del fold_preds
                     gc.collect()
                 
             del X_te
