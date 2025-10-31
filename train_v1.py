@@ -3,6 +3,7 @@ from sklearn.metrics import f1_score
 from sklearn.base import clone
 from xgboost import XGBClassifier
 from tqdm.notebook import tqdm
+from koolbox import Trainer
 import numpy as np
 import itertools
 import warnings
@@ -10,96 +11,9 @@ import optuna
 import joblib
 import glob
 import gc
-import os
-import pandas as pd
-import json
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings('ignore')
-
-class CVTrainer:
-    """Custom cross-validation trainer to replace koolbox.Trainer"""
-    def __init__(self, estimator, cv, cv_args, metric, task="binary", verbose=False, save=True, save_path=None):
-        self.estimator = estimator
-        self.cv = cv
-        self.cv_args = cv_args
-        self.metric = metric
-        self.task = task
-        self.verbose = verbose
-        self.save = save
-        self.save_path = save_path
-        self.oof_preds = None
-        self.models = []
-
-    def fit(self, X, y):
-        """Perform cross-validation training"""
-        # Initialize OOF predictions
-        self.oof_preds = np.zeros(len(y), dtype=np.float32)
-        self.models = []
-
-        # Create save directory if needed
-        if self.save and self.save_path:
-            os.makedirs(self.save_path, exist_ok=True)
-
-        # Perform cross-validation
-        groups = self.cv_args.get("groups", None)
-
-        for fold, (train_idx, val_idx) in enumerate(self.cv.split(X, y, groups=groups)):
-            if self.verbose:
-                print(f"  Training fold {fold}...")
-
-            # Split data
-            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_train, y_val = y[train_idx], y[val_idx]
-
-            # Clone and train model
-            model = clone(self.estimator)
-            model.fit(X_train, y_train)
-
-            # Generate OOF predictions
-            if self.task == "binary":
-                # For binary classification, use predict_proba
-                oof_pred = model.predict_proba(X_val)[:, 1]
-            else:
-                oof_pred = model.predict(X_val)
-
-            self.oof_preds[val_idx] = oof_pred
-            self.models.append(model)
-
-            # Save fold model
-            if self.save and self.save_path:
-                fold_path = os.path.join(self.save_path, f"fold_{fold}.pkl")
-                joblib.dump(model, fold_path)
-
-        # Save the trainer object itself with a pattern matching *_trainer_*.pkl
-        if self.save and self.save_path:
-            trainer_path = os.path.join(self.save_path, "cv_trainer_ensemble.pkl")
-            joblib.dump(self, trainer_path)
-
-        return self
-
-    def predict(self, X):
-        """Generate predictions by averaging across all fold models"""
-        if not self.models:
-            # If models not in memory, load from disk
-            if self.save_path and os.path.exists(self.save_path):
-                fold_files = glob.glob(os.path.join(self.save_path, "fold_*.pkl"))
-                self.models = [joblib.load(f) for f in sorted(fold_files)]
-
-        if not self.models:
-            raise ValueError("No trained models available for prediction")
-
-        # Average predictions across folds
-        predictions = []
-        for model in self.models:
-            if self.task == "binary":
-                pred = model.predict_proba(X)[:, 1]
-            else:
-                pred = model.predict(X)
-            predictions.append(pred)
-
-        return np.mean(predictions, axis=0)
-
 class CFG:
     train_path = "/kaggle/input/MABe-mouse-behavior-detection/train.csv"
     test_path = "/kaggle/input/MABe-mouse-behavior-detection/test.csv"
@@ -126,13 +40,14 @@ class CFG:
         subsample=0.8, 
         colsample_bytree=0.8
     )
+Data loading and preprocessing
 train = pd.read_csv(CFG.train_path)
 train['n_mice'] = 4 - train[['mouse1_strain', 'mouse2_strain', 'mouse3_strain', 'mouse4_strain']].isna().sum(axis=1)
 train_without_mabe22 = train.query("~lab_id.str.startswith('MABe22_')")
 
 test = pd.read_csv(CFG.test_path)
 body_parts_tracked_list = list(np.unique(train.body_parts_tracked))
-# Creating solution data
+Creating solution data
 def create_solution_df(dataset):
     solution = []
     for _, row in tqdm(dataset.iterrows(), total=len(dataset)):
@@ -161,6 +76,7 @@ def create_solution_df(dataset):
 
 if CFG.mode == 'validate':
     solution = create_solution_df(train_without_mabe22)
+Data generator
 drop_body_parts =  [
     'headpiece_bottombackleft', 'headpiece_bottombackright', 'headpiece_bottomfrontleft', 'headpiece_bottomfrontright', 
     'headpiece_topbackleft', 'headpiece_topbackright', 'headpiece_topfrontleft', 'headpiece_topfrontright', 
@@ -250,6 +166,7 @@ def generate_mouse_data(dataset, traintest, traintest_directory=None, generate_s
                         yield 'pair', mouse_pair, mouse_pair_meta, mouse_pair_label
                     else:
                         yield 'pair', mouse_pair, mouse_pair_meta, vid_agent_actions
+Transforming coordinates
 def safe_rolling(series, window, func, min_periods=None):
     if min_periods is None:
         min_periods = max(1, window // 4)
@@ -556,6 +473,7 @@ def transform_pair(mouse_pair, body_parts_tracked, fps):
         X = add_interaction_features(X, mouse_pair, avail_A, avail_B, fps)
 
     return X.astype(np.float32, copy=False)
+Training, validation and submission
 def robustify(submission, dataset, traintest, traintest_directory=None):
     if traintest_directory is None:
         traintest_directory = f"/kaggle/input/MABe-mouse-behavior-detection/{traintest}_tracking"
@@ -693,7 +611,7 @@ def cross_validate_classifier(X, label, meta, body_parts_tracked_str, section):
                 with warnings.catch_warnings():
                     warnings.filterwarnings('ignore', category=RuntimeWarning)
                     
-                    trainer = CVTrainer(
+                    trainer = Trainer(
                         estimator=clone(CFG.model),
                         cv=CFG.cv,
                         cv_args={"groups": groups_action},
@@ -920,7 +838,31 @@ for section in range(1, len(body_parts_tracked_list)):
     except Exception as e:
         print(f"\t{e}")
     print()
+1/9 Processing videos with: ['body_center', 'ear_left', 'ear_right', 'headpiece_bottombackleft', 'headpiece_bottombackright', 'headpiece_bottomfrontleft', 'headpiece_bottomfrontright', 'headpiece_topbackleft', 'headpiece_topbackright', 'headpiece_topfrontleft', 'headpiece_topfrontright', 'lateral_left', 'lateral_right', 'neck', 'nose', 'tail_base', 'tail_midpoint', 'tail_tip']
 
+
+2/9 Processing videos with: ['body_center', 'ear_left', 'ear_right', 'hip_left', 'hip_right', 'lateral_left', 'lateral_right', 'nose', 'spine_1', 'spine_2', 'tail_base', 'tail_middle_1', 'tail_middle_2', 'tail_tip']
+
+
+3/9 Processing videos with: ['body_center', 'ear_left', 'ear_right', 'lateral_left', 'lateral_right', 'neck', 'nose', 'tail_base', 'tail_midpoint', 'tail_tip']
+
+
+4/9 Processing videos with: ['body_center', 'ear_left', 'ear_right', 'lateral_left', 'lateral_right', 'nose', 'tail_base', 'tail_tip']
+
+
+5/9 Processing videos with: ['body_center', 'ear_left', 'ear_right', 'lateral_left', 'lateral_right', 'nose', 'tail_base']
+
+
+6/9 Processing videos with: ['body_center', 'ear_left', 'ear_right', 'nose', 'tail_base']
+
+
+7/9 Processing videos with: ['ear_left', 'ear_right', 'head', 'tail_base']
+
+
+8/9 Processing videos with: ['ear_left', 'ear_right', 'hip_left', 'hip_right', 'neck', 'nose', 'tail_base']
+
+
+9/9 Processing videos with: ['ear_left', 'ear_right', 'nose', 'tail_base', 'tail_tip']
 
 
 if CFG.mode == 'validate':  
@@ -933,6 +875,7 @@ if CFG.mode == 'validate':
   
     joblib.dump(thresholds, f"{CFG.model_name}/thresholds.pkl")
     joblib.dump(f1_df, f"{CFG.model_name}/scores.pkl")
+Submission
 if CFG.mode == 'submit':
     if len(submission_list) > 0:
         submission = pd.concat(submission_list)
@@ -950,4 +893,4 @@ if CFG.mode == 'submit':
     submission_robust = robustify(submission, test, 'test')
     submission_robust.index.name = 'row_id'
     submission_robust.to_csv('submission.csv')
-    submission.head()
+    submission.head() can we use othr tool rather than koolbox? the kaggle does not allow use koolbox
