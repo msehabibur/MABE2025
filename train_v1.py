@@ -3,7 +3,6 @@ from sklearn.metrics import f1_score
 from sklearn.base import clone
 from xgboost import XGBClassifier
 from tqdm.notebook import tqdm
-from koolbox import Trainer
 import numpy as np
 import itertools
 import warnings
@@ -11,9 +10,96 @@ import optuna
 import joblib
 import glob
 import gc
+import os
+import pandas as pd
+import json
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings('ignore')
+
+class CVTrainer:
+    """Custom cross-validation trainer to replace koolbox.Trainer"""
+    def __init__(self, estimator, cv, cv_args, metric, task="binary", verbose=False, save=True, save_path=None):
+        self.estimator = estimator
+        self.cv = cv
+        self.cv_args = cv_args
+        self.metric = metric
+        self.task = task
+        self.verbose = verbose
+        self.save = save
+        self.save_path = save_path
+        self.oof_preds = None
+        self.models = []
+
+    def fit(self, X, y):
+        """Perform cross-validation training"""
+        # Initialize OOF predictions
+        self.oof_preds = np.zeros(len(y), dtype=np.float32)
+        self.models = []
+
+        # Create save directory if needed
+        if self.save and self.save_path:
+            os.makedirs(self.save_path, exist_ok=True)
+
+        # Perform cross-validation
+        groups = self.cv_args.get("groups", None)
+
+        for fold, (train_idx, val_idx) in enumerate(self.cv.split(X, y, groups=groups)):
+            if self.verbose:
+                print(f"  Training fold {fold}...")
+
+            # Split data
+            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+            y_train, y_val = y[train_idx], y[val_idx]
+
+            # Clone and train model
+            model = clone(self.estimator)
+            model.fit(X_train, y_train)
+
+            # Generate OOF predictions
+            if self.task == "binary":
+                # For binary classification, use predict_proba
+                oof_pred = model.predict_proba(X_val)[:, 1]
+            else:
+                oof_pred = model.predict(X_val)
+
+            self.oof_preds[val_idx] = oof_pred
+            self.models.append(model)
+
+            # Save fold model
+            if self.save and self.save_path:
+                fold_path = os.path.join(self.save_path, f"fold_{fold}.pkl")
+                joblib.dump(model, fold_path)
+
+        # Save the trainer object itself with a pattern matching *_trainer_*.pkl
+        if self.save and self.save_path:
+            trainer_path = os.path.join(self.save_path, "cv_trainer_ensemble.pkl")
+            joblib.dump(self, trainer_path)
+
+        return self
+
+    def predict(self, X):
+        """Generate predictions by averaging across all fold models"""
+        if not self.models:
+            # If models not in memory, load from disk
+            if self.save_path and os.path.exists(self.save_path):
+                fold_files = glob.glob(os.path.join(self.save_path, "fold_*.pkl"))
+                self.models = [joblib.load(f) for f in sorted(fold_files)]
+
+        if not self.models:
+            raise ValueError("No trained models available for prediction")
+
+        # Average predictions across folds
+        predictions = []
+        for model in self.models:
+            if self.task == "binary":
+                pred = model.predict_proba(X)[:, 1]
+            else:
+                pred = model.predict(X)
+            predictions.append(pred)
+
+        return np.mean(predictions, axis=0)
+
 class CFG:
     train_path = "/kaggle/input/MABe-mouse-behavior-detection/train.csv"
     test_path = "/kaggle/input/MABe-mouse-behavior-detection/test.csv"
@@ -46,7 +132,7 @@ train_without_mabe22 = train.query("~lab_id.str.startswith('MABe22_')")
 
 test = pd.read_csv(CFG.test_path)
 body_parts_tracked_list = list(np.unique(train.body_parts_tracked))
-Creating solution data
+# Creating solution data
 def create_solution_df(dataset):
     solution = []
     for _, row in tqdm(dataset.iterrows(), total=len(dataset)):
@@ -607,7 +693,7 @@ def cross_validate_classifier(X, label, meta, body_parts_tracked_str, section):
                 with warnings.catch_warnings():
                     warnings.filterwarnings('ignore', category=RuntimeWarning)
                     
-                    trainer = Trainer(
+                    trainer = CVTrainer(
                         estimator=clone(CFG.model),
                         cv=CFG.cv,
                         cv_args={"groups": groups_action},
